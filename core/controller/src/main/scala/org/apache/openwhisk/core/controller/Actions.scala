@@ -263,10 +263,36 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                     .map(_.fields.keySet.forall(key => !actionWithMergedParams.immutableParameters.contains(key)))
                     .getOrElse(true)
 
-                  if (allowInvoke) {
+                  val isConfidential = actionWithMergedParams.annotations.isTruthy("confidential")
+                  val confidentialCheck = if (isConfidential) {
+                    payload match {
+                      case Some(p) =>
+                        val fields = p.fields
+                        val fid = fields.get("FID").flatMap {
+                          case JsString(s) => Some(s)
+                          case _ => None
+                        }
+                        val cReq = fields.contains("C_req")
+                        val cKey = fields.contains("C_key")
+                        val pkU = fields.contains("pkU")
+                        val nonce = fields.contains("nonce")
+
+                        val actionFid = actionWithMergedParams.annotations.getAs[String]("FID").toOption
+
+                        (fid, actionFid) match {
+                          case (Some(f), Some(af)) => f == af && cReq && cKey && pkU && nonce
+                          case _ => false
+                        }
+                      case None => false
+                    }
+                  } else true
+
+                  if (allowInvoke && confidentialCheck) {
                     doInvoke(user, actionWithMergedParams, payload, blocking, waitOverride, result)
-                  } else {
+                  } else if (!allowInvoke) {
                     terminate(BadRequest, Messages.parametersNotAllowed)
+                  } else {
+                    terminate(BadRequest, "Confidential action invocation failed: missing or invalid FID, C_req, C_key, pkU, or nonce.")
                   }
 
                 case Failure(f) =>
