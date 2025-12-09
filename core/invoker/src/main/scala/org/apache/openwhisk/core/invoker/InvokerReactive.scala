@@ -189,6 +189,9 @@ class InvokerReactive(
       val workerPath = "/root/workspace/acsc/sgx_worker/sgx_worker"
       val cmd = Seq(workerPath, "--invoke", fid, wasmPath.toString, inputPath.toString)
       
+      // Set LD_LIBRARY_PATH for SGX libraries
+      val env = sys.env + ("LD_LIBRARY_PATH" -> "/opt/intel/sgxsdk/lib64:/root/workspace/acsc/sgx_worker/lib")
+      
       logging.info(this, s"Executing: ${cmd.mkString(" ")} in ${workerDir.getAbsolutePath}")
       
       val stdout = new StringBuilder
@@ -198,7 +201,7 @@ class InvokerReactive(
         (e: String) => stderr.append(e + "\n")
       )
       
-      val exitCode = Process(cmd, workerDir) ! logger
+      val exitCode = Process(cmd, workerDir, env.toSeq: _*) ! logger
       
       logging.info(this, s"Exit code: $exitCode")
       logging.info(this, s"Stdout: $stdout")
