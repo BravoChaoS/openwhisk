@@ -19,6 +19,11 @@ package org.apache.openwhisk.core.invoker
 
 import java.nio.charset.StandardCharsets
 import java.time.Instant
+import java.nio.file.Files
+import java.util.Base64
+import scala.sys.process._
+import spray.json._
+import spray.json.DefaultJsonProtocol._
 
 import org.apache.pekko.Done
 import org.apache.pekko.actor.{ActorRef, ActorRefFactory, ActorSystem, CoordinatedShutdown, Props}
@@ -160,6 +165,131 @@ class InvokerReactive(
   private val pool =
     actorSystem.actorOf(ContainerPool.props(childFactory, poolConfig, activationFeed, prewarmingConfigs))
 
+  private def runConfidentialAction(action: WhiskAction, msg: ActivationMessage)(implicit transid: TransactionId): Future[Unit] = {
+    Future {
+      logging.info(this, s"Running confidential action ${action.fullyQualifiedName(false)}")
+
+      // 1. Extract fields
+      val fid = action.annotations.getAs[String]("FID").getOrElse("unknown")
+      val cFuncBase64 = action.annotations.getAs[String]("C_func").getOrElse("")
+      
+      val content = msg.content.getOrElse(JsObject.empty).asJsObject
+      val cReqBase64 = content.fields.get("C_req").map(_.convertTo[String]).getOrElse("")
+      
+      // 2. Write to temp files
+      val tempDir = Files.createTempDirectory("sgx_exec")
+      val wasmPath = tempDir.resolve("func.wasm.enc")
+      val inputPath = tempDir.resolve("input.enc")
+      
+      Files.write(wasmPath, Base64.getDecoder.decode(cFuncBase64))
+      Files.write(inputPath, Base64.getDecoder.decode(cReqBase64))
+      
+      // 3. Run sgx_worker from its directory (required for enclave.signed.so)
+      val workerDir = new java.io.File("/root/workspace/acsc/sgx_worker")
+      val workerPath = "/root/workspace/acsc/sgx_worker/sgx_worker"
+      val cmd = Seq(workerPath, "--invoke", fid, wasmPath.toString, inputPath.toString)
+      
+      // Auto-detect SGX mode from .sgx_mode file
+      val sgxModeFile = new java.io.File("/root/workspace/acsc/demo/.sgx_mode")
+      val sgxMode = if (sgxModeFile.exists()) {
+        scala.io.Source.fromFile(sgxModeFile).getLines().mkString.trim
+      } else {
+        "HW"  // Default to HW mode
+      }
+      
+      // Set LD_LIBRARY_PATH based on SGX mode
+      val ldLibPath = if (sgxMode == "HW") {
+        "/usr/lib/x86_64-linux-gnu"
+      } else {
+        "/opt/intel/sgxsdk/lib64:/opt/intel/sgxsdk/sdk_libs"
+      }
+      val env = sys.env + ("LD_LIBRARY_PATH" -> ldLibPath)
+      
+      logging.info(this, s"SGX Mode: $sgxMode, LD_LIBRARY_PATH: $ldLibPath")
+      
+      val stdout = new StringBuilder
+      val stderr = new StringBuilder
+      val logger = ProcessLogger(
+        (o: String) => stdout.append(o + "\n"),
+        (e: String) => stderr.append(e + "\n")
+      )
+      
+      val exitCode = Process(cmd, workerDir, env.toSeq: _*) ! logger
+      
+      logging.info(this, s"Exit code: $exitCode")
+      logging.info(this, s"Stdout: $stdout")
+      
+      if (exitCode == 0) {
+        // Parse output to find RESULT_HEX
+        val outputStr = stdout.toString()
+        val resultHexPrefix = "RESULT_HEX:"
+        val resultLine = outputStr.linesIterator.find(_.startsWith(resultHexPrefix))
+        
+        val resultJson = resultLine match {
+          case Some(line) =>
+            val hex = line.substring(resultHexPrefix.length)
+            // Hex to Bytes
+            val bytes = hex.sliding(2, 2).toArray.map(Integer.parseInt(_, 16).toByte)
+            val base64Result = Base64.getEncoder.encodeToString(bytes)
+            
+            JsObject(
+              "C_out" -> JsString(base64Result),
+              "ct" -> JsString("mock_ct")
+            )
+          case None =>
+            JsObject("error" -> JsString("No result from enclave"))
+        }
+        
+        // Send Completion Message
+        val activation = WhiskActivation(
+          activationId = msg.activationId,
+          namespace = msg.user.namespace.name.toPath,
+          subject = msg.user.subject,
+          cause = msg.cause,
+          name = msg.action.name,
+          version = msg.action.version.getOrElse(SemVer()),
+          start = Instant.now(),
+          end = Instant.now(),
+          response = ActivationResponse.success(Some(resultJson)),
+          logs = ActivationLogs(Vector(stdout.toString, stderr.toString)),
+          duration = Some(100)
+        )
+        
+        // Store activation and send completion
+        val context = UserContext(msg.user)
+        store(transid, activation, true, context)
+        val completion = CombinedCompletionAndResultMessage(transid, activation, instance)
+        producer.send(ConfigKeys.loadbalancer, completion)
+      } else {
+        logging.error(this, s"SGX Worker failed: $stderr")
+        // Send Failure Message
+         val activation = WhiskActivation(
+          activationId = msg.activationId,
+          namespace = msg.user.namespace.name.toPath,
+          subject = msg.user.subject,
+          cause = msg.cause,
+          name = msg.action.name,
+          version = msg.action.version.getOrElse(SemVer()),
+          start = Instant.now(),
+          end = Instant.now(),
+          response = ActivationResponse.whiskError(s"SGX Worker failed: $stderr"),
+          logs = ActivationLogs(Vector(stdout.toString, stderr.toString)),
+          duration = Some(100)
+        )
+        // Store activation and send completion
+        val context = UserContext(msg.user)
+        store(transid, activation, true, context)
+        val completion = CombinedCompletionAndResultMessage(transid, activation, instance)
+        producer.send(ConfigKeys.loadbalancer, completion)
+      }
+      
+      // Cleanup
+      Files.deleteIfExists(wasmPath)
+      Files.deleteIfExists(inputPath)
+      Files.deleteIfExists(tempDir)
+    }
+  }
+
   def handleActivationMessage(msg: ActivationMessage)(implicit transid: TransactionId): Future[Unit] = {
     val namespace = msg.action.path
     val name = msg.action.name
@@ -178,13 +308,18 @@ class InvokerReactive(
       .flatMap(action => {
         // action that exceed the limit cannot be executed.
         action.limits.checkLimits(msg.user)
-        action.toExecutableWhiskAction match {
-          case Some(executable) =>
-            pool ! Run(executable, msg)
-            Future.successful(())
-          case None =>
-            logging.error(this, s"non-executable action reached the invoker ${action.fullyQualifiedName(false)}")
-            Future.failed(new IllegalStateException("non-executable action reached the invoker"))
+        
+        if (action.annotations.isTruthy("confidential")) {
+            runConfidentialAction(action, msg)
+        } else {
+            action.toExecutableWhiskAction match {
+              case Some(executable) =>
+                pool ! Run(executable, msg)
+                Future.successful(())
+              case None =>
+                logging.error(this, s"non-executable action reached the invoker ${action.fullyQualifiedName(false)}")
+                Future.failed(new IllegalStateException("non-executable action reached the invoker"))
+            }
         }
       })
       .recoverWith {
