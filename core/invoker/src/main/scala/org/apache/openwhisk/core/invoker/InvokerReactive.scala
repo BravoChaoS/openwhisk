@@ -189,10 +189,23 @@ class InvokerReactive(
       val workerPath = "/root/workspace/acsc/sgx_worker/sgx_worker"
       val cmd = Seq(workerPath, "--invoke", fid, wasmPath.toString, inputPath.toString)
       
-      // Set LD_LIBRARY_PATH for SGX libraries
-      val env = sys.env + ("LD_LIBRARY_PATH" -> "/opt/intel/sgxsdk/lib64:/root/workspace/acsc/sgx_worker/lib")
+      // Auto-detect SGX mode from .sgx_mode file
+      val sgxModeFile = new java.io.File("/root/workspace/acsc/demo/.sgx_mode")
+      val sgxMode = if (sgxModeFile.exists()) {
+        scala.io.Source.fromFile(sgxModeFile).getLines().mkString.trim
+      } else {
+        "HW"  // Default to HW mode
+      }
       
-      logging.info(this, s"Executing: ${cmd.mkString(" ")} in ${workerDir.getAbsolutePath}")
+      // Set LD_LIBRARY_PATH based on SGX mode
+      val ldLibPath = if (sgxMode == "HW") {
+        "/usr/lib/x86_64-linux-gnu"
+      } else {
+        "/opt/intel/sgxsdk/lib64:/opt/intel/sgxsdk/sdk_libs"
+      }
+      val env = sys.env + ("LD_LIBRARY_PATH" -> ldLibPath)
+      
+      logging.info(this, s"SGX Mode: $sgxMode, LD_LIBRARY_PATH: $ldLibPath")
       
       val stdout = new StringBuilder
       val stderr = new StringBuilder
