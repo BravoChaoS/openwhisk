@@ -239,6 +239,9 @@ class InvokerReactive(
           duration = Some(100)
         )
         
+        // Store activation and send completion
+        val context = UserContext(msg.user)
+        store(transid, activation, true, context)
         val completion = CombinedCompletionAndResultMessage(transid, activation, instance)
         producer.send(ConfigKeys.loadbalancer, completion)
       } else {
@@ -257,6 +260,9 @@ class InvokerReactive(
           logs = ActivationLogs(Vector(stdout.toString, stderr.toString)),
           duration = Some(100)
         )
+        // Store activation and send completion
+        val context = UserContext(msg.user)
+        store(transid, activation, true, context)
         val completion = CombinedCompletionAndResultMessage(transid, activation, instance)
         producer.send(ConfigKeys.loadbalancer, completion)
       }
