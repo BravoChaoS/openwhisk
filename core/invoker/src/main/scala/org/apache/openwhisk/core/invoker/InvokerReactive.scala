@@ -172,9 +172,11 @@ class InvokerReactive(
       // 1. Extract fields
       val fid = action.annotations.getAs[String]("FID").getOrElse("unknown")
       val cFuncBase64 = action.annotations.getAs[String]("C_func").getOrElse("")
+      val cKFuncBase64 = action.annotations.getAs[String]("C_k_func").getOrElse("")
       
       val content = msg.content.getOrElse(JsObject.empty).asJsObject
       val cReqBase64 = content.fields.get("C_req").map(_.convertTo[String]).getOrElse("")
+      val cKeyBase64 = content.fields.get("C_key").map(_.convertTo[String]).getOrElse("")
       val pkUBase64 = content.fields.get("pkU").map(_.convertTo[String]).getOrElse("")
       val nonceBase64 = content.fields.get("nonce").map(_.convertTo[String]).getOrElse("")
       
@@ -182,18 +184,34 @@ class InvokerReactive(
       val tempDir = Files.createTempDirectory("sgx_exec")
       val wasmPath = tempDir.resolve("func.wasm.enc")
       val inputPath = tempDir.resolve("input.enc")
+      val cKFuncPath = tempDir.resolve("c_k_func.enc")
+      val cKeyPath = tempDir.resolve("c_key.enc")
       val pkUPath = tempDir.resolve("pku.bin")
       val noncePath = tempDir.resolve("nonce.bin")
       
       Files.write(wasmPath, Base64.getDecoder.decode(cFuncBase64))
       Files.write(inputPath, Base64.getDecoder.decode(cReqBase64))
+      Files.write(cKFuncPath, Base64.getDecoder.decode(cKFuncBase64))
+      Files.write(cKeyPath, Base64.getDecoder.decode(cKeyBase64))
       Files.write(pkUPath, Base64.getDecoder.decode(pkUBase64))
       Files.write(noncePath, Base64.getDecoder.decode(nonceBase64))
       
       // 3. Run sgx_worker from its directory (required for enclave.signed.so)
       val workerDir = new java.io.File("/root/workspace/acsc/sgx_worker")
       val workerPath = "/root/workspace/acsc/sgx_worker/sgx_worker"
-      val cmd = Seq(workerPath, "--invoke", fid, wasmPath.toString, inputPath.toString, pkUPath.toString, noncePath.toString)
+      val cmd =
+        Seq(
+          workerPath,
+          "--invoke",
+          fid,
+          wasmPath.toString,
+          inputPath.toString,
+          "--keys",
+          cKFuncPath.toString,
+          cKeyPath.toString,
+          pkUPath.toString,
+          noncePath.toString
+        )
       
       // Auto-detect SGX mode from .sgx_mode file
       val sgxModeFile = new java.io.File("/root/workspace/acsc/demo/.sgx_mode")
@@ -305,6 +323,8 @@ class InvokerReactive(
       Files.deleteIfExists(inputPath)
       Files.deleteIfExists(pkUPath)
       Files.deleteIfExists(noncePath)
+      Files.deleteIfExists(cKFuncPath)
+      Files.deleteIfExists(cKeyPath)
       Files.deleteIfExists(tempDir)
     }
   }
