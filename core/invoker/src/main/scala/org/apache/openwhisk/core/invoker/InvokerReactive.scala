@@ -175,19 +175,22 @@ class InvokerReactive(
       
       val content = msg.content.getOrElse(JsObject.empty).asJsObject
       val cReqBase64 = content.fields.get("C_req").map(_.convertTo[String]).getOrElse("")
+      val pkUBase64 = content.fields.get("pkU").map(_.convertTo[String]).getOrElse("")
       
       // 2. Write to temp files
       val tempDir = Files.createTempDirectory("sgx_exec")
       val wasmPath = tempDir.resolve("func.wasm.enc")
       val inputPath = tempDir.resolve("input.enc")
+      val pkUPath = tempDir.resolve("pku.bin")
       
       Files.write(wasmPath, Base64.getDecoder.decode(cFuncBase64))
       Files.write(inputPath, Base64.getDecoder.decode(cReqBase64))
+      Files.write(pkUPath, Base64.getDecoder.decode(pkUBase64))
       
       // 3. Run sgx_worker from its directory (required for enclave.signed.so)
       val workerDir = new java.io.File("/root/workspace/acsc/sgx_worker")
       val workerPath = "/root/workspace/acsc/sgx_worker/sgx_worker"
-      val cmd = Seq(workerPath, "--invoke", fid, wasmPath.toString, inputPath.toString)
+      val cmd = Seq(workerPath, "--invoke", fid, wasmPath.toString, inputPath.toString, pkUPath.toString)
       
       // Auto-detect SGX mode from .sgx_mode file
       val sgxModeFile = new java.io.File("/root/workspace/acsc/demo/.sgx_mode")
@@ -220,9 +223,11 @@ class InvokerReactive(
       logging.info(this, s"Stdout: $stdout")
       
       if (exitCode == 0) {
-        // Parse output to find RESULT_HEX
+        // Parse output to find CT_HEX and RESULT_HEX
         val outputStr = stdout.toString()
+        val ctHexPrefix = "CT_HEX:"
         val resultHexPrefix = "RESULT_HEX:"
+        val ctLine = outputStr.linesIterator.find(_.startsWith(ctHexPrefix))
         val resultLine = outputStr.linesIterator.find(_.startsWith(resultHexPrefix))
         
         val resultJson = resultLine match {
@@ -231,10 +236,19 @@ class InvokerReactive(
             // Hex to Bytes
             val bytes = hex.sliding(2, 2).toArray.map(Integer.parseInt(_, 16).toByte)
             val base64Result = Base64.getEncoder.encodeToString(bytes)
+
+            val ctB64 = ctLine match {
+              case Some(ct) =>
+                val ctHex = ct.substring(ctHexPrefix.length)
+                val ctBytes = ctHex.sliding(2, 2).toArray.map(Integer.parseInt(_, 16).toByte)
+                Base64.getEncoder.encodeToString(ctBytes)
+              case None =>
+                ""
+            }
             
             JsObject(
               "C_out" -> JsString(base64Result),
-              "ct" -> JsString("mock_ct")
+              "ct" -> JsString(ctB64)
             )
           case None =>
             JsObject("error" -> JsString("No result from enclave"))
@@ -286,6 +300,7 @@ class InvokerReactive(
       // Cleanup
       Files.deleteIfExists(wasmPath)
       Files.deleteIfExists(inputPath)
+      Files.deleteIfExists(pkUPath)
       Files.deleteIfExists(tempDir)
     }
   }
