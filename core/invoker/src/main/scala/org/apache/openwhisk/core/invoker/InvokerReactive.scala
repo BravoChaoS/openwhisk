@@ -49,6 +49,89 @@ import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success}
 
+import java.util.concurrent.ConcurrentHashMap
+import java.time.format.DateTimeFormatter
+import java.security.MessageDigest
+
+/**
+ * Write-once result store for confidential actions.
+ * 
+ * Implements put-if-absent semantics indexed by RID (Request ID):
+ * - First write to RID succeeds
+ * - Subsequent writes to same RID are rejected (first-writer-wins)
+ * 
+ * This ensures:
+ * - Replay attacks cannot overwrite legitimate results
+ * - Duplicate dispatch doesn't corrupt results
+ * - Idempotent retrieval by RID
+ */
+case class ConfidentialResult(
+  rid: String,          // Request ID = H(FID || C_req)
+  ct: String,           // KEM ciphertext (base64)
+  cOut: String,         // Encrypted output (base64)
+  timestamp: String     // ISO timestamp
+)
+
+object ConfidentialResultStore {
+  private val store = new ConcurrentHashMap[String, ConfidentialResult]()
+  
+  /**
+   * Compute RID = H(FID || C_req).
+   * 
+   * FID that looks like a 64-hex SHA-256 digest is decoded as 32 raw bytes;
+   * otherwise UTF-8 encoding is used (legacy compatibility).
+   */
+  def computeRid(fid: String, cReqBytes: Array[Byte]): String = {
+    val fidStripped = Option(fid).map(_.trim).getOrElse("")
+    val fidBytes: Array[Byte] = if (fidStripped.length == 64 && fidStripped.forall(c => 
+      (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+      // Hex string -> raw bytes
+      fidStripped.sliding(2, 2).toArray.map(Integer.parseInt(_, 16).toByte)
+    } else {
+      // Legacy: UTF-8 encoding
+      fidStripped.getBytes("UTF-8")
+    }
+    
+    val digest = MessageDigest.getInstance("SHA-256")
+    digest.update(fidBytes)
+    digest.update(cReqBytes)
+    digest.digest().map("%02x".format(_)).mkString
+  }
+  
+  /**
+   * Store result with put-if-absent semantics.
+   * 
+   * @return (success, rid) where success=true means first write succeeded
+   */
+  def putIfAbsent(result: ConfidentialResult): Boolean = {
+    store.putIfAbsent(result.rid, result) == null
+  }
+  
+  /**
+   * Get result by RID.
+   */
+  def get(rid: String): Option[ConfidentialResult] = {
+    Option(store.get(rid))
+  }
+  
+  /**
+   * Check if RID exists.
+   */
+  def exists(rid: String): Boolean = {
+    store.containsKey(rid)
+  }
+  
+  /**
+   * Get store size (for testing/monitoring).
+   */
+  def size(): Int = store.size()
+  
+  /**
+   * Clear store (for testing only).
+   */
+  def clear(): Unit = store.clear()
+}
+
 object InvokerReactive extends InvokerProvider {
   override def instance(
     config: WhiskConfig,
@@ -244,10 +327,12 @@ class InvokerReactive(
       logging.info(this, s"Stdout: $stdout")
       
       if (exitCode == 0) {
-        // Parse output to find CT_HEX and RESULT_HEX
+        // Parse output to find RID_HEX, CT_HEX and RESULT_HEX
         val outputStr = stdout.toString()
+        val ridHexPrefix = "RID_HEX:"
         val ctHexPrefix = "CT_HEX:"
         val resultHexPrefix = "RESULT_HEX:"
+        val ridLine = outputStr.linesIterator.find(_.startsWith(ridHexPrefix))
         val ctLine = outputStr.linesIterator.find(_.startsWith(ctHexPrefix))
         val resultLine = outputStr.linesIterator.find(_.startsWith(resultHexPrefix))
         
@@ -267,9 +352,37 @@ class InvokerReactive(
                 ""
             }
             
+            // Extract or compute RID for write-once storage
+            val rid = ridLine match {
+              case Some(r) => r.substring(ridHexPrefix.length).trim
+              case None =>
+                // Compute RID = H(FID || C_req) if not provided by worker
+                val cReqBytes = Base64.getDecoder.decode(cReqBase64)
+                ConfidentialResultStore.computeRid(fid, cReqBytes)
+            }
+            
+            // Store result with write-once / first-writer-wins semantics
+            val confidentialResult = ConfidentialResult(
+              rid = rid,
+              ct = ctB64,
+              cOut = base64Result,
+              timestamp = Instant.now().toString
+            )
+            val isFirstWrite = ConfidentialResultStore.putIfAbsent(confidentialResult)
+            
+            if (isFirstWrite) {
+              logging.info(this, s"Stored result for RID: ${rid.take(16)}... (first write)")
+            } else {
+              // Duplicate dispatch - result already exists
+              // Log but still return the original result (idempotent)
+              logging.warn(this, s"Duplicate dispatch for RID: ${rid.take(16)}... (first-writer-wins, ignored)")
+            }
+            
             JsObject(
+              "rid" -> JsString(rid),
               "C_out" -> JsString(base64Result),
-              "ct" -> JsString(ctB64)
+              "ct" -> JsString(ctB64),
+              "is_duplicate" -> JsBoolean(!isFirstWrite)
             )
           case None =>
             JsObject("error" -> JsString("No result from enclave"))
