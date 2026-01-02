@@ -302,6 +302,7 @@ class ContainerProxy(factory: (TransactionId,
       implicit val transid = job.msg.transid
       activeCount += 1
       // create a new container
+      val createStartNs = System.nanoTime()
       val container = factory(
         job.msg.transid,
         ContainerProxy.containerName(instance, job.msg.user.namespace.name.asString, job.action.name.asString),
@@ -347,8 +348,11 @@ class ContainerProxy(factory: (TransactionId,
             storeActivation(transid, activation, job.msg.blocking, context)
         }
         .flatMap { container =>
+          val createDurNs = math.max(0L, System.nanoTime() - createStartNs)
+          val metrics = job.msg.metrics + ("ow_container_create_dur_ns" -> createDurNs)
+          val jobWithMetrics = job.copy(msg = job.msg.copy(metrics = metrics))
           // now attempt to inject the user code and run the action
-          initializeAndRun(container, job)
+          initializeAndRun(container, jobWithMetrics)
             .map(_ => RunCompleted)
         }
         .pipeTo(self)
@@ -1057,6 +1061,20 @@ object ContainerProxy {
       initInterval.map(initTime => Parameters(WhiskActivation.initTimeAnnotation, initTime.duration.toMillis.toJson))
     }
 
+    val initMetrics = initInterval
+      .map(interval => Map("ow_container_init_dur_ns" -> interval.duration.toNanos))
+      .getOrElse(Map.empty)
+    val durationMetrics = (job.msg.metrics ++ initMetrics)
+      .collect {
+        case (k, v) if k.endsWith("_dur_ns") => (k, JsNumber(v))
+      }
+    val timingAnnotation =
+      if (durationMetrics.nonEmpty) {
+        Some(Parameters("ow_timings", JsObject(durationMetrics)))
+      } else {
+        None
+      }
+
     val binding =
       job.msg.action.binding.map(f => Parameters(WhiskActivation.bindingAnnotation, JsString(f.asString)))
 
@@ -1076,7 +1094,7 @@ object ContainerProxy {
           Parameters(WhiskActivation.pathAnnotation, JsString(job.action.fullyQualifiedName(false).asString)) ++
           Parameters(WhiskActivation.kindAnnotation, JsString(job.action.exec.kind)) ++
           Parameters(WhiskActivation.timeoutAnnotation, JsBoolean(isTimeout)) ++
-          causedBy ++ initTime ++ waitTime ++ binding
+          causedBy ++ initTime ++ waitTime ++ binding ++ timingAnnotation
       })
   }
 

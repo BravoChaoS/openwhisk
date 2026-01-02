@@ -50,7 +50,6 @@ import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success}
 
 import java.util.concurrent.ConcurrentHashMap
-import java.time.format.DateTimeFormatter
 import java.security.MessageDigest
 
 /**
@@ -251,6 +250,15 @@ class InvokerReactive(
   private def runConfidentialAction(action: WhiskAction, msg: ActivationMessage)(implicit transid: TransactionId): Future[Unit] = {
     Future {
       logging.info(this, s"Running confidential action ${action.fullyQualifiedName(false)}")
+      val durationMetrics = msg.metrics.collect {
+        case (k, v) if k.endsWith("_dur_ns") => (k, JsNumber(v))
+      }
+      val timingAnnotation =
+        if (durationMetrics.nonEmpty) {
+          Parameters("ow_timings", JsObject(durationMetrics))
+        } else {
+          Parameters()
+        }
 
       // 1. Extract fields
       val fid = action.annotations.getAs[String]("FID").getOrElse("unknown")
@@ -400,6 +408,7 @@ class InvokerReactive(
           end = Instant.now(),
           response = ActivationResponse.success(Some(resultJson)),
           logs = ActivationLogs(Vector(stdout.toString, stderr.toString)),
+          annotations = timingAnnotation,
           duration = Some(100)
         )
         
@@ -422,6 +431,7 @@ class InvokerReactive(
           end = Instant.now(),
           response = ActivationResponse.whiskError(s"SGX Worker failed: $stderr"),
           logs = ActivationLogs(Vector(stdout.toString, stderr.toString)),
+          annotations = timingAnnotation,
           duration = Some(100)
         )
         // Store activation and send completion
@@ -518,10 +528,21 @@ class InvokerReactive(
 
         //set trace context to continue tracing
         WhiskTracerProvider.tracer.setTraceContext(transid, msg.traceContext)
+        val invokerRecvNs = System.nanoTime()
+        val baseMetrics = msg.metrics
+        val withRecv = baseMetrics + ("ow_invoker_recv_ns" -> invokerRecvNs)
+        val metrics =
+          baseMetrics.get("ow_ctrl_enqueue_ns") match {
+            case Some(enqueueNs) if invokerRecvNs >= enqueueNs =>
+              withRecv + ("ow_queue_dur_ns" -> (invokerRecvNs - enqueueNs))
+            case _ =>
+              withRecv
+          }
+        val msgWithMetrics = if (metrics eq baseMetrics) msg else msg.copy(metrics = metrics)
 
         if (!namespaceBlacklist.isBlacklisted(msg.user)) {
           val start = transid.started(this, LoggingMarkers.INVOKER_ACTIVATION, logLevel = InfoLevel)
-          handleActivationMessage(msg)
+          handleActivationMessage(msgWithMetrics)
         } else {
           // Iff the current namespace is blacklisted, an active-ack is only produced to keep the loadbalancer protocol
           // Due to the protective nature of the blacklist, a database entry is not written.

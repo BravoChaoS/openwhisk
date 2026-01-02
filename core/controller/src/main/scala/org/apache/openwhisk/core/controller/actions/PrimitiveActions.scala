@@ -155,6 +155,7 @@ protected[actions] trait PrimitiveActions {
     payload: Option[JsValue],
     waitForResponse: Option[FiniteDuration],
     cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
+    val ctrlStartNs = System.nanoTime()
 
     // merge package parameters with action (action parameters supersede), then merge in payload
     val args: Option[JsValue] = payload match {
@@ -177,6 +178,12 @@ protected[actions] trait PrimitiveActions {
       case Some(JsObject(fields)) => Some(fields.keySet)
       case _                      => None
     }
+    val ctrlEnqueueNs = System.nanoTime()
+    val ctrlDurNs = math.max(0L, ctrlEnqueueNs - ctrlStartNs)
+    val metrics = Map(
+      "ow_ctrl_dur_ns" -> ctrlDurNs,
+      "ow_ctrl_enqueue_ns" -> ctrlEnqueueNs
+    )
     val message = ActivationMessage(
       transid,
       FullyQualifiedEntityName(action.namespace, action.name, Some(action.version), action.binding),
@@ -189,7 +196,8 @@ protected[actions] trait PrimitiveActions {
       action.parameters.initParameters,
       action.parameters.lockedParameters(keySet.getOrElse(Set.empty)),
       cause = cause,
-      WhiskTracerProvider.tracer.getTraceContext(transid))
+      WhiskTracerProvider.tracer.getTraceContext(transid),
+      metrics = metrics)
 
     val postedFuture = loadBalancer.publish(action, message)
 
