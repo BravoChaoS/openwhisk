@@ -178,11 +178,11 @@ protected[actions] trait PrimitiveActions {
       case Some(JsObject(fields)) => Some(fields.keySet)
       case _                      => None
     }
-    val ctrlEnqueueNs = System.nanoTime()
-    val ctrlDurNs = math.max(0L, ctrlEnqueueNs - ctrlStartNs)
+    val ctrlEnqueueNs = System.nanoTime() // [# breakpoints]
+    val ctrlDurNs = math.max(0L, ctrlEnqueueNs - ctrlStartNs) // [# breakpoints]
     val metrics = Map(
-      "ow_ctrl_dur_ns" -> ctrlDurNs,
-      "ow_ctrl_enqueue_ns" -> ctrlEnqueueNs
+      "ow_ctrl_dur_ns" -> ctrlDurNs, // [# breakpoints]
+      "ow_ctrl_enqueue_ns" -> ctrlEnqueueNs // [# breakpoints]
     )
     val message = ActivationMessage(
       transid,

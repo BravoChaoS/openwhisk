@@ -348,8 +348,8 @@ class ContainerProxy(factory: (TransactionId,
             storeActivation(transid, activation, job.msg.blocking, context)
         }
         .flatMap { container =>
-          val createDurNs = math.max(0L, System.nanoTime() - createStartNs)
-          val metrics = job.msg.metrics + ("ow_container_create_dur_ns" -> createDurNs)
+          val createDurNs = math.max(0L, System.nanoTime() - createStartNs) // [# breakpoints]
+          val metrics = job.msg.metrics + ("ow_container_create_dur_ns" -> createDurNs) // [# breakpoints]
           val jobWithMetrics = job.copy(msg = job.msg.copy(metrics = metrics))
           // now attempt to inject the user code and run the action
           initializeAndRun(container, jobWithMetrics)
@@ -1062,7 +1062,7 @@ object ContainerProxy {
     }
 
     val initMetrics = initInterval
-      .map(interval => Map("ow_container_init_dur_ns" -> interval.duration.toNanos))
+      .map(interval => Map("ow_container_init_dur_ns" -> interval.duration.toNanos)) // [# breakpoints]
       .getOrElse(Map.empty)
     val durationMetrics = (job.msg.metrics ++ initMetrics)
       .collect {

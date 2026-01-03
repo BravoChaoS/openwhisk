@@ -528,13 +528,13 @@ class InvokerReactive(
 
         //set trace context to continue tracing
         WhiskTracerProvider.tracer.setTraceContext(transid, msg.traceContext)
-        val invokerRecvNs = System.nanoTime()
+        val invokerRecvNs = System.nanoTime() // [# breakpoints]
         val baseMetrics = msg.metrics
         val withRecv = baseMetrics + ("ow_invoker_recv_ns" -> invokerRecvNs)
         val metrics =
           baseMetrics.get("ow_ctrl_enqueue_ns") match {
             case Some(enqueueNs) if invokerRecvNs >= enqueueNs =>
-              withRecv + ("ow_queue_dur_ns" -> (invokerRecvNs - enqueueNs))
+              withRecv + ("ow_queue_dur_ns" -> (invokerRecvNs - enqueueNs)) // [# breakpoints]
             case _ =>
               withRecv
           }
