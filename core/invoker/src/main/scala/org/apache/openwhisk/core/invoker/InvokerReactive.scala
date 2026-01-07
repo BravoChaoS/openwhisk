@@ -374,7 +374,7 @@ class InvokerReactive(
               rid = rid,
               ct = ctB64,
               cOut = base64Result,
-              timestamp = Instant.now().toString
+              timestamp = Instant.now().toString // [# breakpoints]
             )
             val isFirstWrite = ConfidentialResultStore.putIfAbsent(confidentialResult)
             
@@ -404,8 +404,8 @@ class InvokerReactive(
           cause = msg.cause,
           name = msg.action.name,
           version = msg.action.version.getOrElse(SemVer()),
-          start = Instant.now(),
-          end = Instant.now(),
+          start = Instant.now(), // [# breakpoints]
+          end = Instant.now(), // [# breakpoints]
           response = ActivationResponse.success(Some(resultJson)),
           logs = ActivationLogs(Vector(stdout.toString, stderr.toString)),
           annotations = timingAnnotation,
@@ -427,8 +427,8 @@ class InvokerReactive(
           cause = msg.cause,
           name = msg.action.name,
           version = msg.action.version.getOrElse(SemVer()),
-          start = Instant.now(),
-          end = Instant.now(),
+          start = Instant.now(), // [# breakpoints]
+          end = Instant.now(), // [# breakpoints]
           response = ActivationResponse.whiskError(s"SGX Worker failed: $stderr"),
           logs = ActivationLogs(Vector(stdout.toString, stderr.toString)),
           annotations = timingAnnotation,
@@ -578,7 +578,7 @@ class InvokerReactive(
    * Set the kind annotation to `Exec.UNKNOWN` since it is not known to the invoker because the action fetch failed.
    */
   private def generateFallbackActivation(msg: ActivationMessage, response: ActivationResponse): WhiskActivation = {
-    val now = Instant.now
+    val now = Instant.now // [# breakpoints]
     val causedBy = if (msg.causedBySequence) {
       Some(Parameters(WhiskActivation.causedByAnnotation, JsString(Exec.SEQUENCE)))
     } else None

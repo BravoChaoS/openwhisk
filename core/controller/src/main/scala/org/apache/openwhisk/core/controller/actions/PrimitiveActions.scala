@@ -155,7 +155,7 @@ protected[actions] trait PrimitiveActions {
     payload: Option[JsValue],
     waitForResponse: Option[FiniteDuration],
     cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
-    val ctrlStartNs = System.nanoTime()
+    val ctrlStartNs = System.nanoTime() // [# breakpoints]
 
     // merge package parameters with action (action parameters supersede), then merge in payload
     val args: Option[JsValue] = payload match {
@@ -295,7 +295,7 @@ protected[actions] trait PrimitiveActions {
 
     val session = Session(
       activationId = activationIdFactory.make(),
-      start = Instant.now(Clock.systemUTC()),
+      start = Instant.now(Clock.systemUTC()), // [# breakpoints]
       action,
       cause,
       duration = 0,
@@ -590,7 +590,7 @@ protected[actions] trait PrimitiveActions {
     val binding =
       session.action.binding.map(f => Parameters(WhiskActivation.bindingAnnotation, JsString(f.asString)))
 
-    val end = Instant.now(Clock.systemUTC())
+    val end = Instant.now(Clock.systemUTC()) // [# breakpoints]
 
     // create the whisk activation
     val activation = WhiskActivation(
