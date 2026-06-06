@@ -1,0 +1,50 @@
+openwhisk_tmp_dir: "{{ lookup('env', 'OPENWHISK_TMP_DIR')|default('/var/tmp/asyncs-openwhisk-clab20-control', true) }}"
+config_root_dir: "{{ openwhisk_tmp_dir }}/wskconf"
+whisk_logs_dir: "{{ openwhisk_tmp_dir }}/wsklogs"
+coverage_enabled: "{{ lookup('env', 'GRADLE_COVERAGE') | default('false', true) | bool}}"
+coverage_logs_dir: "{{ openwhisk_tmp_dir }}/wskcov"
+
+# Component images are built on clab20 and pushed to the local registry before
+# distributed deployment, so invoker nodes do not need Docker Hub access.
+# Control-plane services run on clab20, where the HTTP registry is reachable as
+# localhost. Remote invokers override this host variable to clab20:5000.
+docker_registry: "localhost:5000/"
+runtimes_registry: "clab20:5000/"
+docker_dns: ""
+runtimes_bypass_pull_for_local_images: false
+manifest_file: "/ansible/files/runtimes-clab-nodejs20.json"
+
+# The clab Docker hosts may not expose the same runc binary path/version as the
+# OpenWhisk image expects. Use Docker pause/unpause for the cluster baseline.
+invoker_use_runc: false
+invoker_allow_multiple_instances: false
+
+db_prefix: whisk_clab20_
+
+# API GW connection configuration
+apigw_auth_user: ""
+apigw_auth_pwd: ""
+apigw_host_v2: "http://{{ groups['apigateway']|first }}:{{apigateway.port.api}}/v2"
+
+# Keep the first native OW baseline compact; scale after the two-invoker path is
+# deployable and measurable.
+kafka_heap: '512m'
+kafka_topics_completed_retentionBytes: 104857600
+kafka_topics_completed_retentionMS: 300000
+kafka_topics_health_retentionBytes: 104857600
+kafka_topics_health_retentionMS: 300000
+kafka_topics_invoker_retentionBytes: 104857600
+kafka_topics_invoker_retentionMS: 300000
+
+env_hosts_dir: "{{ playbook_dir }}/environments/clab20-control"
+environment_type: distributed
+
+container_pool_pekko_client: true
+runtimes_enable_concurrency: true
+limit_action_concurrency_max: 500
+namespace_default_limit_action_concurrency_max: 500
+
+# The clab native baseline stores activations in CouchDB and does not deploy
+# Elasticsearch, so the scheduler must not use the Elasticsearch-backed
+# duration checker.
+duration_checker_spi: "org.apache.openwhisk.core.scheduler.queue.NoopDurationCheckerProvider"
