@@ -1,0 +1,31 @@
+{
+    "description": [
+        "clab native OpenWhisk baseline runtime manifest.",
+        "Keep only nodejs:20 for the initial level-3 warm-path baseline."
+    ],
+    "runtimes": {
+        "nodejs": [
+            {
+                "kind": "nodejs:20",
+                "default": true,
+                "image": {
+                    "prefix": "openwhisk",
+                    "name": "action-nodejs-v20",
+                    "tag": "nightly"
+                },
+                "deprecated": false,
+                "attached": {
+                    "attachmentName": "codefile",
+                    "attachmentType": "text/plain"
+                },
+                "stemCells": [
+                    {
+                        "count": 2,
+                        "memory": "256 MB"
+                    }
+                ]
+            }
+        ]
+    },
+    "blackboxes": []
+}
