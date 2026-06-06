@@ -23,4 +23,5 @@
 - hosts: edge
   roles:
   - nginx
-  - cli
+  - role: cli
+    when: openwhisk_cli.publish | default(true)

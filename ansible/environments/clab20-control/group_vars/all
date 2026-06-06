@@ -14,6 +14,24 @@ docker_dns: ""
 runtimes_bypass_pull_for_local_images: false
 manifest_file: "/ansible/files/runtimes-clab-nodejs20.json"
 
+openwhisk_cli:
+  publish: false
+  install: false
+
+# clab20 is prepared from clab01-cached images because Docker Hub DNS is not
+# reliable on compute nodes. Do not force Ansible roles to pull these service
+# images from external registries during deployment.
+couchdb:
+  pull_couchdb: false
+zookeeper:
+  pull_zookeeper: false
+kafka:
+  pull_kafka: false
+etcd:
+  pull_etcd: false
+nginx:
+  pull_nginx: false
+
 # The clab Docker hosts may not expose the same runc binary path/version as the
 # OpenWhisk image expects. Use Docker pause/unpause for the cluster baseline.
 invoker_use_runc: false

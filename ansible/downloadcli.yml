@@ -19,4 +19,5 @@
 
 - hosts: ansible
   roles:
-  - cli-install
+  - role: cli-install
+    when: openwhisk_cli.install | default(true)

@@ -65,6 +65,7 @@
   until: (result.rc == 0)
   retries: "{{ docker.pull.retries }}"
   delay: "{{ docker.pull.delay }}"
+  when: nginx.pull_nginx | default(true)
 
 - name: ensure html directory exists
   stat:
