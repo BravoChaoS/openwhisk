@@ -18,6 +18,10 @@ kafkas
 [invokers]
 invoker0 ansible_host=192.168.5.103 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/usr/bin/python3 docker_registry=clab20:5000/
 invoker1 ansible_host=192.168.5.104 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/usr/bin/python3 docker_registry=clab20:5000/
+invoker2 ansible_host=192.168.5.105 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/usr/bin/python3 docker_registry=clab20:5000/
+invoker3 ansible_host=192.168.5.106 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/usr/bin/python3 docker_registry=clab20:5000/
+invoker4 ansible_host=192.168.5.107 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/usr/bin/python3 docker_registry=clab20:5000/
+invoker5 ansible_host=192.168.5.108 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/usr/bin/python3 docker_registry=clab20:5000/
 
 [schedulers]
 scheduler0 ansible_host=192.168.5.120 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
