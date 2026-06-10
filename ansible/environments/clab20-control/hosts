@@ -4,13 +4,13 @@
 ansible ansible_connection=local ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
 
 [edge]
-192.168.5.120 ansible_host=192.168.5.120 ansible_connection=local ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
+192.168.5.120 ansible_host=192.168.5.120 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
 
 [controllers]
-controller0 ansible_host=192.168.5.120 ansible_connection=local ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
+controller0 ansible_host=192.168.5.120 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
 
 [kafkas]
-kafka0 ansible_host=192.168.5.120 ansible_connection=local ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
+kafka0 ansible_host=192.168.5.120 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
 
 [zookeepers:children]
 kafkas
@@ -20,20 +20,20 @@ invoker0 ansible_host=192.168.5.103 ansible_connection=ssh ansible_user=liyc ans
 invoker1 ansible_host=192.168.5.104 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/usr/bin/python3 docker_registry=clab20:5000/
 
 [schedulers]
-scheduler0 ansible_host=192.168.5.120 ansible_connection=local ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
+scheduler0 ansible_host=192.168.5.120 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
 
 ; db group is only used if db.provider is CouchDB
 [db]
-192.168.5.120 ansible_host=192.168.5.120 ansible_connection=local ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
+192.168.5.120 ansible_host=192.168.5.120 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
 
 [elasticsearch:children]
 db
 
 [redis]
-192.168.5.120 ansible_host=192.168.5.120 ansible_connection=local ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
+192.168.5.120 ansible_host=192.168.5.120 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
 
 [apigateway]
-192.168.5.120 ansible_host=192.168.5.120 ansible_connection=local ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
+192.168.5.120 ansible_host=192.168.5.120 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
 
 [etcd]
-etcd0 ansible_host=192.168.5.120 ansible_connection=local ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
+etcd0 ansible_host=192.168.5.120 ansible_connection=ssh ansible_user=liyc ansible_python_interpreter=/data/work/liyc/.venvs/openwhisk-ansible/bin/python
