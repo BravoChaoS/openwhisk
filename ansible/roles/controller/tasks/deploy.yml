@@ -247,6 +247,10 @@
 
       "CONFIG_whisk_activation_payload_max":
         "{{ limit_activation_payload | default() }}"
+      "CONFIG_whisk_namespaceDefaultLimit_activation_payload_max":
+        "{{ limit_activation_payload | default() }}"
+      "CONFIG_whisk_namespaceDefaultLimit_activation_payload_truncation":
+        "{{ limit_activation_payload | default() }}"
 
       "RUNTIMES_MANIFEST": "{{ runtimesManifest | to_json }}"
       "CONFIG_whisk_runtimes_defaultImagePrefix":
