@@ -214,6 +214,9 @@
       "CONFIG_whisk_namespaceDefaultLimit_concurrencyLimit_min": "{{ namespace_default_limit_action_concurrency_min | default() }}"
       "CONFIG_whisk_namespaceDefaultLimit_concurrencyLimit_max": "{{ namespace_default_limit_action_concurrency_max | default() }}"
 
+      "CONFIG_whisk_parameterSizeLimit": "{{ limit_action_parameter_size | default() }}"
+      "CONFIG_whisk_namespaceDefaultLimit_parameterSizeLimit": "{{ limit_action_parameter_size | default() }}"
+
       "RUNTIMES_MANIFEST": "{{ runtimesManifest | to_json }}"
       "CONFIG_whisk_runtimes_defaultImagePrefix":
         "{{ runtimes_default_image_prefix | default() }}"

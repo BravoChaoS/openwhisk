@@ -237,6 +237,11 @@
       "CONFIG_whisk_namespaceDefaultLimit_concurrencyLimit_min": "{{ namespace_default_limit_action_concurrency_min | default() }}"
       "CONFIG_whisk_namespaceDefaultLimit_concurrencyLimit_max": "{{ namespace_default_limit_action_concurrency_max | default() }}"
 
+      "CONFIG_whisk_parameterSizeLimit":
+        "{{ limit_action_parameter_size | default() }}"
+      "CONFIG_whisk_namespaceDefaultLimit_parameterSizeLimit":
+        "{{ limit_action_parameter_size | default() }}"
+
       "CONFIG_whisk_featureFlags_requireApiKeyAnnotation": "{{ whisk.feature_flags.require_api_key_annotation | default(true) | lower }}"
       "CONFIG_whisk_featureFlags_requireResponsePayload": "{{ whisk.feature_flags.require_response_payload | default(true) | lower }}"
 
