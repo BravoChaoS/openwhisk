@@ -322,6 +322,13 @@
   loop_control:
     loop_var: inv_item
 
+- name: extend invoker action container docker device args env
+  set_fact:
+    env: "{{ env | default({}) | combine( {'CONFIG_whisk_containerFactory_containerArgs_extraArgs_device_' ~ inv_item.0: inv_item.1} ) }}"
+  with_indexed_items: "{{ invoker_container_extra_args_devices | default([]) }}"
+  loop_control:
+    loop_var: inv_item
+
 - name: merge extra env variables
   set_fact:
     env: "{{ env | combine(invoker.extraEnv) }}"
