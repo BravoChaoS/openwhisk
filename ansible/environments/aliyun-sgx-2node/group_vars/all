@@ -1,0 +1,58 @@
+openwhisk_tmp_dir: "{{ lookup('env', 'OPENWHISK_TMP_DIR')|default('/var/tmp/asyncs-openwhisk-aliyun-sgx-2node', true) }}"
+config_root_dir: "{{ openwhisk_tmp_dir }}/wskconf"
+whisk_logs_dir: "{{ openwhisk_tmp_dir }}/wsklogs"
+coverage_enabled: "{{ lookup('env', 'GRADLE_COVERAGE') | default('false', true) | bool}}"
+coverage_logs_dir: "{{ openwhisk_tmp_dir }}/wskcov"
+
+docker_registry: "localhost:5000/"
+runtimes_registry: "172.18.89.214:5000/"
+docker_dns: ""
+runtimes_bypass_pull_for_local_images: false
+manifest_file: "/ansible/files/runtimes-clab-nodejs20.json"
+whisk_api_host_name: "172.18.89.214"
+db_host: "172.18.89.214"
+
+openwhisk_cli:
+  publish: false
+  install: false
+
+couchdb:
+  pull_couchdb: true
+zookeeper:
+  pull_zookeeper: true
+kafka:
+  pull_kafka: true
+etcd:
+  pull_etcd: true
+nginx:
+  pull_nginx: true
+
+invoker_use_runc: false
+invoker_allow_multiple_instances: true
+invoker_container_extra_args_devices:
+  - /dev/sgx_enclave
+  - /dev/sgx_provision
+
+db_prefix: whisk_aliyun_sgx_
+
+apigw_auth_user: ""
+apigw_auth_pwd: ""
+apigw_host_v2: "http://172.18.89.214:{{apigateway.port.api}}/v2"
+
+kafka_heap: '512m'
+kafka_topics_completed_retentionBytes: 104857600
+kafka_topics_completed_retentionMS: 300000
+kafka_topics_health_retentionBytes: 104857600
+kafka_topics_health_retentionMS: 300000
+kafka_topics_invoker_retentionBytes: 104857600
+kafka_topics_invoker_retentionMS: 300000
+
+env_hosts_dir: "{{ playbook_dir }}/environments/aliyun-sgx-2node"
+environment_type: distributed
+
+container_pool_pekko_client: true
+runtimes_enable_concurrency: true
+limit_action_concurrency_max: 500
+namespace_default_limit_action_concurrency_max: 500
+
+duration_checker_spi: "org.apache.openwhisk.core.scheduler.queue.NoopDurationCheckerProvider"
