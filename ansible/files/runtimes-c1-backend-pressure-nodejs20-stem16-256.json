@@ -1,0 +1,31 @@
+{
+    "description": [
+        "C1 backend-pressure native diagnostic runtime manifest.",
+        "Keep only nodejs:20 and use sixteen 256 MB stem cells per invoker so backend-pressure actions match the prewarm pool."
+    ],
+    "runtimes": {
+        "nodejs": [
+            {
+                "kind": "nodejs:20",
+                "default": true,
+                "image": {
+                    "prefix": "openwhisk",
+                    "name": "action-nodejs-v20",
+                    "tag": "nightly"
+                },
+                "deprecated": false,
+                "attached": {
+                    "attachmentName": "codefile",
+                    "attachmentType": "text/plain"
+                },
+                "stemCells": [
+                    {
+                        "count": 16,
+                        "memory": "256 MB"
+                    }
+                ]
+            }
+        ]
+    },
+    "blackboxes": []
+}
