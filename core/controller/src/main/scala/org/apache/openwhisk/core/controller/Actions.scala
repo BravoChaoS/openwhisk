@@ -276,8 +276,9 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                       plannedSubmitMonoNs: Long,
                                       actualSubmitMonoNs: Long,
                                       sourceScheduleLagNs: Long)(
-    implicit transid: TransactionId): Future[C1BackendPressureOutcome] = {
+    implicit parentTransid: TransactionId): Future[C1BackendPressureOutcome] = {
     val logicalRequestIdString = logicalRequestId.toString
+    val logicalTransid = TransactionId.childOf(parentTransid)
     val metadata = BackendPressureMetadata(
       runId = request.run_id,
       logicalRequestId = logicalRequestIdString,
@@ -291,7 +292,8 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       actualSubmitMonoNs = actualSubmitMonoNs,
       sourceScheduleLagNs = sourceScheduleLagNs)
 
-    invokeBackendPressureAction(user, action, Some(c1BackendPressurePayload(request, logicalRequestId)), metadata)
+    invokeBackendPressureAction(user, action, Some(c1BackendPressurePayload(request, logicalRequestId)), metadata)(
+      logicalTransid)
       .map { result =>
         if (!result.completed) {
           c1BackendPressureStatusDetail(
@@ -299,7 +301,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             logicalRequestIdString,
             result.status,
             result.reason,
-            Some(result.activationId))
+            Some(result.activationId))(logicalTransid)
         }
         C1BackendPressureOutcome(logicalRequestIdString, Right(result))
       }
@@ -310,7 +312,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             request.run_id,
             logicalRequestIdString,
             BackendPressureActivationResult.Failed,
-            reason)
+            reason)(logicalTransid)
           C1BackendPressureOutcome(logicalRequestIdString, Left(reason))
       }
   }
