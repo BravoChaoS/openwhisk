@@ -128,21 +128,84 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                               payload_bytes: Int,
                                               workload_id: String,
                                               request_generation_mode: String,
-                                              target_arrival_rate_per_sec: Double,
-                                              duration_sec: Int,
+                                              target_arrival_rate_per_sec: Option[Double],
+                                              duration_sec: Option[Int],
                                               planned_logical_requests: Int,
-                                              max_inflight_safety_limit: Int)
+                                              max_inflight_safety_limit: Int,
+                                              ramp_rate_schedule_per_sec: Option[Vector[Double]] = None,
+                                              ramp_stage_duration_sec: Option[Int] = None)
 
-  private implicit val c1BackendPressureRequestFormat = jsonFormat14(C1BackendPressureRequest)
+  private implicit object C1BackendPressureRequestFormat extends RootJsonFormat[C1BackendPressureRequest] {
+    private def required[T](fields: Map[String, JsValue], name: String)(implicit reader: JsonReader[T]): T =
+      fields.get(name).map(_.convertTo[T]).getOrElse(deserializationError(s"$name is required"))
+
+    private def optional[T](fields: Map[String, JsValue], name: String)(implicit reader: JsonReader[T]): Option[T] =
+      fields.get(name) match {
+        case Some(JsNull) => None
+        case Some(value)  => Some(value.convertTo[T])
+        case None         => None
+      }
+
+    override def read(value: JsValue): C1BackendPressureRequest = {
+      val fields = value.asJsObject.fields
+      C1BackendPressureRequest(
+        namespace = required[String](fields, "namespace"),
+        action = required[String](fields, "action"),
+        profile = required[String](fields, "profile"),
+        run_id = required[String](fields, "run_id"),
+        concurrency = required[Int](fields, "concurrency"),
+        logical_requests = required[Int](fields, "logical_requests"),
+        failure_probability = required[Double](fields, "failure_probability"),
+        payload_bytes = required[Int](fields, "payload_bytes"),
+        workload_id = required[String](fields, "workload_id"),
+        request_generation_mode = required[String](fields, "request_generation_mode"),
+        target_arrival_rate_per_sec = optional[Double](fields, "target_arrival_rate_per_sec"),
+        duration_sec = optional[Int](fields, "duration_sec"),
+        planned_logical_requests = required[Int](fields, "planned_logical_requests"),
+        max_inflight_safety_limit = required[Int](fields, "max_inflight_safety_limit"),
+        ramp_rate_schedule_per_sec = optional[Vector[Double]](fields, "ramp_rate_schedule_per_sec"),
+        ramp_stage_duration_sec = optional[Int](fields, "ramp_stage_duration_sec"))
+    }
+
+    override def write(request: C1BackendPressureRequest): JsValue = {
+      val baseFields: Map[String, JsValue] = Map(
+        "namespace" -> JsString(request.namespace),
+        "action" -> JsString(request.action),
+        "profile" -> JsString(request.profile),
+        "run_id" -> JsString(request.run_id),
+        "concurrency" -> JsNumber(request.concurrency),
+        "logical_requests" -> JsNumber(request.logical_requests),
+        "failure_probability" -> JsNumber(request.failure_probability),
+        "payload_bytes" -> JsNumber(request.payload_bytes),
+        "workload_id" -> JsString(request.workload_id),
+        "request_generation_mode" -> JsString(request.request_generation_mode),
+        "planned_logical_requests" -> JsNumber(request.planned_logical_requests),
+        "max_inflight_safety_limit" -> JsNumber(request.max_inflight_safety_limit))
+      val optionalFields: Map[String, JsValue] = Seq(
+        request.target_arrival_rate_per_sec.map("target_arrival_rate_per_sec" -> JsNumber(_)),
+        request.duration_sec.map("duration_sec" -> JsNumber(_)),
+        request.ramp_rate_schedule_per_sec.map(rates => "ramp_rate_schedule_per_sec" -> JsArray(rates.map(JsNumber(_)))),
+        request.ramp_stage_duration_sec.map("ramp_stage_duration_sec" -> JsNumber(_))).flatten.toMap
+      JsObject(baseFields ++ optionalFields)
+    }
+  }
 
   private val c1BackendPressureMode = "controller-internal-queue"
   private val c1BackendPressureRequestModeOpenLoop = "open_loop_rate"
+  private val c1BackendPressureRequestModeRamp = "open_loop_ramp"
   private val c1BackendPressureControllerSourceEnv = "C1_BACKEND_PRESSURE_CONTROLLER_SOURCE"
   private val c1BackendPressureMaxLogicalRequests = 100000
   private val c1BackendPressureMaxPayloadBytes = 1048576
 
   private case class C1BackendPressureOutcome(logicalRequestId: String,
                                               result: Either[String, BackendPressureActivationResult])
+
+  private case class C1BackendPressureScheduleEntry(logicalRequestId: Int,
+                                                    plannedSubmitOffsetNs: Long,
+                                                    rampStageIndex: Option[Int] = None,
+                                                    rampStageRatePerSec: Option[Double] = None,
+                                                    rampStageStartOffsetNs: Option[Long] = None,
+                                                    rampStageEndOffsetNs: Option[Long] = None)
 
   private def c1BackendPressureControllerSourceEnabled: Boolean =
     sys.env.get(c1BackendPressureControllerSourceEnv).contains("1")
@@ -153,6 +216,38 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
   private def validateC1BackendPressureRequest(request: C1BackendPressureRequest): Option[String] = {
     def errorIf(condition: Boolean, message: String): Option[String] = if (condition) Some(message) else None
 
+    val modeErrors = request.request_generation_mode match {
+      case `c1BackendPressureRequestModeOpenLoop` =>
+        val planned = request.target_arrival_rate_per_sec
+          .zip(request.duration_sec)
+          .map { case (rate, duration) => math.floor(rate * duration).toInt }
+        Seq(
+          errorIf(request.target_arrival_rate_per_sec.forall(_ <= 0.0), "target_arrival_rate_per_sec must be positive"),
+          errorIf(request.duration_sec.forall(_ <= 0), "duration_sec must be positive"),
+          errorIf(
+            planned.forall(_ != request.planned_logical_requests),
+            "planned_logical_requests must equal floor(target_arrival_rate_per_sec * duration_sec)"),
+          errorIf(
+            request.logical_requests != request.planned_logical_requests,
+            "logical_requests must equal planned_logical_requests for open_loop_rate"),
+          errorIf(request.ramp_rate_schedule_per_sec.exists(_.nonEmpty), "ramp_rate_schedule_per_sec is only valid for open_loop_ramp"),
+          errorIf(request.ramp_stage_duration_sec.nonEmpty, "ramp_stage_duration_sec is only valid for open_loop_ramp"))
+      case `c1BackendPressureRequestModeRamp` =>
+        val schedule = request.ramp_rate_schedule_per_sec.getOrElse(Vector.empty)
+        val stageDuration = request.ramp_stage_duration_sec.getOrElse(0)
+        val planned = schedule.map(rate => math.floor(rate * stageDuration).toInt).sum
+        Seq(
+          errorIf(schedule.isEmpty, "ramp_rate_schedule_per_sec is required for open_loop_ramp"),
+          errorIf(schedule.exists(_ <= 0.0), "ramp_rate_schedule_per_sec values must be positive"),
+          errorIf(stageDuration <= 0, "ramp_stage_duration_sec must be positive"),
+          errorIf(planned != request.planned_logical_requests, "planned_logical_requests must equal sum floor(ramp_rate * ramp_stage_duration_sec)"),
+          errorIf(
+            request.logical_requests != request.planned_logical_requests,
+            "logical_requests must equal planned_logical_requests for open_loop_ramp"))
+      case _ =>
+        Seq(Some(s"request_generation_mode must be $c1BackendPressureRequestModeOpenLoop or $c1BackendPressureRequestModeRamp"))
+    }
+
     val errors = Seq(
       errorIf(request.namespace.trim.isEmpty, "namespace is required"),
       errorIf(request.action.trim.isEmpty, "action is required"),
@@ -160,22 +255,11 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       errorIf(request.run_id.trim.isEmpty, "run_id is required"),
       errorIf(request.concurrency <= 0, "concurrency must be positive"),
       errorIf(request.logical_requests <= 0, "logical_requests must be positive"),
-      errorIf(
-        request.request_generation_mode != c1BackendPressureRequestModeOpenLoop,
-        s"request_generation_mode must be $c1BackendPressureRequestModeOpenLoop"),
-      errorIf(request.target_arrival_rate_per_sec <= 0.0, "target_arrival_rate_per_sec must be positive"),
-      errorIf(request.duration_sec <= 0, "duration_sec must be positive"),
       errorIf(request.planned_logical_requests <= 0, "planned_logical_requests must be positive"),
       errorIf(request.max_inflight_safety_limit <= 0, "max_inflight_safety_limit must be positive"),
       errorIf(
-        request.planned_logical_requests != math.floor(request.target_arrival_rate_per_sec * request.duration_sec).toInt,
-        "planned_logical_requests must equal floor(target_arrival_rate_per_sec * duration_sec)"),
-      errorIf(
         request.planned_logical_requests > request.max_inflight_safety_limit,
         "planned_logical_requests must not exceed max_inflight_safety_limit"),
-      errorIf(
-        request.logical_requests != request.planned_logical_requests,
-        "logical_requests must equal planned_logical_requests for open_loop_rate"),
       errorIf(
         request.logical_requests > c1BackendPressureMaxLogicalRequests,
         s"logical_requests must be <= $c1BackendPressureMaxLogicalRequests"),
@@ -186,33 +270,46 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       errorIf(
         request.failure_probability < 0.0 || request.failure_probability > 1.0,
         "failure_probability must be between 0.0 and 1.0"),
-      errorIf(request.workload_id.trim.isEmpty, "workload_id is required")).flatten
+      errorIf(request.workload_id.trim.isEmpty, "workload_id is required")).flatten ++ modeErrors.flatten
 
     if (errors.isEmpty) None else Some(errors.mkString("; "))
   }
 
-  private def c1BackendPressurePayload(request: C1BackendPressureRequest, logicalRequestId: Int): JsObject = {
-    JsObject(
+  private def c1BackendPressurePayload(request: C1BackendPressureRequest,
+                                       scheduleEntry: C1BackendPressureScheduleEntry): JsObject = {
+    val baseFields: Map[String, JsValue] = Map(
       "collection_id" -> JsString("C1"),
       "entry_mode" -> JsString(c1BackendPressureMode),
       "db_store_policy" -> JsString("skipped-for-backend-pressure"),
       "pressure_source" -> JsString("controller-internal"),
       "profile" -> JsString(request.profile),
       "run_id" -> JsString(request.run_id),
-      "logical_request_id" -> JsString(logicalRequestId.toString),
+      "logical_request_id" -> JsString(scheduleEntry.logicalRequestId.toString),
       "concurrency" -> JsNumber(request.concurrency),
       "request_generation_mode" -> JsString(request.request_generation_mode),
-      "target_arrival_rate_per_sec" -> JsNumber(request.target_arrival_rate_per_sec),
-      "duration_sec" -> JsNumber(request.duration_sec),
+      "target_arrival_rate_per_sec" -> JsNumber(scheduleEntry.rampStageRatePerSec.orElse(request.target_arrival_rate_per_sec).getOrElse(0.0)),
+      "duration_sec" -> JsNumber(request.duration_sec.orElse(request.ramp_stage_duration_sec).getOrElse(0)),
       "planned_logical_requests" -> JsNumber(request.planned_logical_requests),
       "max_inflight_safety_limit" -> JsNumber(request.max_inflight_safety_limit),
       "failure_probability" -> JsNumber(request.failure_probability),
       "payload_bytes" -> JsNumber(request.payload_bytes),
       "workload_id" -> JsString(request.workload_id),
       "payload" -> JsString("x" * request.payload_bytes))
+    val rampFields: Map[String, JsValue] = scheduleEntry.rampStageIndex
+      .map { stageIndex =>
+        Map(
+          "ramp_stage_index" -> JsNumber(stageIndex),
+          "ramp_stage_rate_per_sec" -> JsNumber(scheduleEntry.rampStageRatePerSec.getOrElse(0.0)),
+          "ramp_stage_start_offset_ns" -> JsNumber(scheduleEntry.rampStageStartOffsetNs.getOrElse(0L)),
+          "ramp_stage_end_offset_ns" -> JsNumber(scheduleEntry.rampStageEndOffsetNs.getOrElse(0L)),
+          "planned_submit_offset_ns" -> JsNumber(scheduleEntry.plannedSubmitOffsetNs))
+      }
+      .getOrElse(Map.empty[String, JsValue])
+    JsObject(baseFields ++ rampFields)
   }
 
   private def c1BackendPressureResponse(runId: String,
+                                        requestGenerationMode: String,
                                         submitted: Int,
                                         completed: Int,
                                         failed: Int,
@@ -241,7 +338,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
     JsObject(
       "mode" -> JsString(c1BackendPressureMode),
       "run_id" -> JsString(runId),
-      "request_generation_mode" -> JsString(c1BackendPressureRequestModeOpenLoop),
+      "request_generation_mode" -> JsString(requestGenerationMode),
       "submitted" -> JsNumber(submitted),
       "completed" -> JsNumber(completed),
       "failed" -> JsNumber(failed),
@@ -272,12 +369,12 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
   private def c1BackendPressureInvoke(user: Identity,
                                       action: WhiskActionMetaData,
                                       request: C1BackendPressureRequest,
-                                      logicalRequestId: Int,
+                                      scheduleEntry: C1BackendPressureScheduleEntry,
                                       plannedSubmitMonoNs: Long,
                                       actualSubmitMonoNs: Long,
                                       sourceScheduleLagNs: Long)(
     implicit parentTransid: TransactionId): Future[C1BackendPressureOutcome] = {
-    val logicalRequestIdString = logicalRequestId.toString
+    val logicalRequestIdString = scheduleEntry.logicalRequestId.toString
     val logicalTransid = TransactionId.childOf(parentTransid)
     val metadata = BackendPressureMetadata(
       runId = request.run_id,
@@ -285,14 +382,19 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       profile = request.profile,
       concurrency = request.concurrency,
       requestGenerationMode = request.request_generation_mode,
-      targetArrivalRatePerSec = request.target_arrival_rate_per_sec,
-      durationSec = request.duration_sec,
+      targetArrivalRatePerSec = scheduleEntry.rampStageRatePerSec.orElse(request.target_arrival_rate_per_sec).getOrElse(0.0),
+      durationSec = request.duration_sec.orElse(request.ramp_stage_duration_sec).getOrElse(0),
       plannedLogicalRequests = request.planned_logical_requests,
+      rampStageIndex = scheduleEntry.rampStageIndex,
+      rampStageRatePerSec = scheduleEntry.rampStageRatePerSec,
+      rampStageStartOffsetNs = scheduleEntry.rampStageStartOffsetNs,
+      rampStageEndOffsetNs = scheduleEntry.rampStageEndOffsetNs,
+      plannedSubmitOffsetNs = Some(scheduleEntry.plannedSubmitOffsetNs),
       plannedSubmitMonoNs = plannedSubmitMonoNs,
       actualSubmitMonoNs = actualSubmitMonoNs,
       sourceScheduleLagNs = sourceScheduleLagNs)
 
-    invokeBackendPressureAction(user, action, Some(c1BackendPressurePayload(request, logicalRequestId)), metadata)(
+    invokeBackendPressureAction(user, action, Some(c1BackendPressurePayload(request, scheduleEntry)), metadata)(
       logicalTransid)
       .map { result =>
         if (!result.completed) {
@@ -326,15 +428,55 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
     }
   }
 
-  private def runC1BackendPressureOpenLoopRate(user: Identity,
-                                               action: WhiskActionMetaData,
-                                               request: C1BackendPressureRequest)(
+  private def c1BackendPressureOpenLoopRateSchedule(
+    request: C1BackendPressureRequest): Vector[C1BackendPressureScheduleEntry] = {
+    val rate = request.target_arrival_rate_per_sec.get
+    (1 to request.planned_logical_requests).toVector.map { logicalRequestId =>
+      C1BackendPressureScheduleEntry(
+        logicalRequestId = logicalRequestId,
+        plannedSubmitOffsetNs = math.floor((logicalRequestId - 1).toDouble * 1000000000.0 / rate).toLong)
+    }
+  }
+
+  private def c1BackendPressureOpenLoopRampSchedule(
+    request: C1BackendPressureRequest): Vector[C1BackendPressureScheduleEntry] = {
+    val stageDurationSec = request.ramp_stage_duration_sec.get
+    val stageDurationNs = stageDurationSec.toLong * 1000000000L
+    val entries = Vector.newBuilder[C1BackendPressureScheduleEntry]
+    var logicalRequestId = 1
+    var stageStartOffsetNs = 0L
+
+    request.ramp_rate_schedule_per_sec.get.zipWithIndex.foreach {
+      case (rate, zeroBasedStageIndex) =>
+        val stageIndex = zeroBasedStageIndex + 1
+        val stageEndOffsetNs = stageStartOffsetNs + stageDurationNs
+        val stagePlannedRequests = math.floor(rate * stageDurationSec).toInt
+        (0 until stagePlannedRequests).foreach { requestIndexInStage =>
+          val plannedSubmitOffsetNs =
+            stageStartOffsetNs + math.floor(requestIndexInStage.toDouble * 1000000000.0 / rate).toLong
+          entries += C1BackendPressureScheduleEntry(
+            logicalRequestId = logicalRequestId,
+            plannedSubmitOffsetNs = plannedSubmitOffsetNs,
+            rampStageIndex = Some(stageIndex),
+            rampStageRatePerSec = Some(rate),
+            rampStageStartOffsetNs = Some(stageStartOffsetNs),
+            rampStageEndOffsetNs = Some(stageEndOffsetNs))
+          logicalRequestId += 1
+        }
+        stageStartOffsetNs = stageEndOffsetNs
+    }
+
+    entries.result()
+  }
+
+  private def runC1BackendPressureSchedule(user: Identity,
+                                           action: WhiskActionMetaData,
+                                           request: C1BackendPressureRequest,
+                                           schedule: Vector[C1BackendPressureScheduleEntry])(
     implicit transid: TransactionId): Future[Vector[C1BackendPressureOutcome]] = {
     val runStartMonoNs = System.nanoTime()
-    val logicalRequestIds = (1 to request.planned_logical_requests).toVector
-    val scheduled = logicalRequestIds.map { logicalRequestId =>
-      val plannedSubmitMonoNs =
-        runStartMonoNs + math.floor((logicalRequestId - 1).toDouble * 1000000000.0 / request.target_arrival_rate_per_sec).toLong
+    val scheduled = schedule.map { scheduleEntry =>
+      val plannedSubmitMonoNs = runStartMonoNs + scheduleEntry.plannedSubmitOffsetNs
       waitUntilMonoNs(plannedSubmitMonoNs).flatMap { _ =>
         val actualSubmitMonoNs = System.nanoTime()
         val sourceScheduleLagNs = math.max(0L, actualSubmitMonoNs - plannedSubmitMonoNs)
@@ -342,14 +484,26 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
           user,
           action,
           request,
-          logicalRequestId,
+          scheduleEntry,
           plannedSubmitMonoNs,
           actualSubmitMonoNs,
           sourceScheduleLagNs)
-        }
+      }
     }
     Future.sequence(scheduled)
   }
+
+  private def runC1BackendPressureOpenLoopRate(user: Identity,
+                                               action: WhiskActionMetaData,
+                                               request: C1BackendPressureRequest)(
+    implicit transid: TransactionId): Future[Vector[C1BackendPressureOutcome]] =
+    runC1BackendPressureSchedule(user, action, request, c1BackendPressureOpenLoopRateSchedule(request))
+
+  private def runC1BackendPressureOpenLoopRamp(user: Identity,
+                                               action: WhiskActionMetaData,
+                                               request: C1BackendPressureRequest)(
+    implicit transid: TransactionId): Future[Vector[C1BackendPressureOutcome]] =
+    runC1BackendPressureSchedule(user, action, request, c1BackendPressureOpenLoopRampSchedule(request))
 
   def backendPressureRoutes(user: Identity)(implicit transid: TransactionId) = {
     (path("c1" / "backend-pressure") & post) {
@@ -384,7 +538,13 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                       onComplete(checks) {
                         case Success(_) =>
                           val submitted = request.planned_logical_requests
-                          onComplete(runC1BackendPressureOpenLoopRate(user, action, request)) {
+                          val run = request.request_generation_mode match {
+                            case `c1BackendPressureRequestModeRamp` =>
+                              runC1BackendPressureOpenLoopRamp(user, action, request)
+                            case _ =>
+                              runC1BackendPressureOpenLoopRate(user, action, request)
+                          }
+                          onComplete(run) {
                             case Success(results) =>
                               val completed = results.count {
                                 case C1BackendPressureOutcome(_, Right(result)) => result.completed
@@ -405,6 +565,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                 OK,
                                 c1BackendPressureResponse(
                                   request.run_id,
+                                  request.request_generation_mode,
                                   submitted,
                                   completed,
                                   failed,

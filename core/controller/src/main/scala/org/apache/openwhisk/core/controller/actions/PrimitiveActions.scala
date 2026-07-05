@@ -96,6 +96,11 @@ protected[actions] trait PrimitiveActions {
       c1TimingField("target_arrival_rate_per_sec", metadata.targetArrivalRatePerSec.toString),
       c1TimingField("duration_sec", metadata.durationSec.toString),
       c1TimingField("planned_logical_requests", metadata.plannedLogicalRequests.toString),
+      c1TimingField("ramp_stage_index", metadata.rampStageIndex.map(_.toString).getOrElse("")),
+      c1TimingField("ramp_stage_rate_per_sec", metadata.rampStageRatePerSec.map(_.toString).getOrElse("")),
+      c1TimingField("ramp_stage_start_offset_ns", metadata.rampStageStartOffsetNs.map(_.toString).getOrElse("")),
+      c1TimingField("ramp_stage_end_offset_ns", metadata.rampStageEndOffsetNs.map(_.toString).getOrElse("")),
+      c1TimingField("planned_submit_offset_ns", metadata.plannedSubmitOffsetNs.map(_.toString).getOrElse("")),
       c1TimingField("planned_submit_mono_ns", metadata.plannedSubmitMonoNs.toString),
       c1TimingField("actual_submit_mono_ns", metadata.actualSubmitMonoNs.toString),
       c1TimingField("source_schedule_lag_ns", metadata.sourceScheduleLagNs.toString))
