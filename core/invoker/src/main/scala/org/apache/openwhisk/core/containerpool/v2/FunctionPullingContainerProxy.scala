@@ -17,8 +17,10 @@
 
 package org.apache.openwhisk.core.containerpool.v2
 
+import java.lang.management.ManagementFactory
 import java.net.InetSocketAddress
 import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
 import org.apache.pekko.actor.Status.{Failure => FailureMessage}
 import org.apache.pekko.actor.{ActorRef, ActorRefFactory, ActorSystem, FSM, Props, Stash}
 import org.apache.pekko.event.Logging.InfoLevel
@@ -225,11 +227,81 @@ class FunctionPullingContainerProxy(
   private val PingCacheName = "PingCache"
   private val pingCacheInterval = 1.minute
   private var timedOut = false
+  private val c1TimingProcessId = ManagementFactory.getRuntimeMXBean.getName.takeWhile(_ != '@')
+  private val c1TimingNode = sys.env.get("C1_TIMING_NODE_ID").orElse(sys.env.get("HOSTNAME")).getOrElse("")
+  private val c1InternalRescheduleInjectionReason = "c1_internal_reschedule_injection"
 
   var healthPingActor: Option[ActorRef] = None //setup after prewarm starts
   val tcp: ActorRef = testTcp.getOrElse(IO(Tcp)) //allows to testing interaction with Tcp extension
 
-  val runningActivations = new java.util.concurrent.ConcurrentHashMap[String, Boolean]
+  val runningActivations = new ConcurrentHashMap[String, Boolean]
+  private val c1InternalRescheduleInjectionEnabled = sys.env
+    .get("C1_INTERNAL_RESCHEDULE_INJECTION_ENABLED")
+    .map(_.trim.toLowerCase)
+    .exists(value => value == "1" || value == "true" || value == "yes")
+
+  private def c1TimingSanitize(value: String): String =
+    value.replace('|', '_').replace('\n', ' ').replace('\r', ' ')
+
+  private def c1TimingField(key: String, value: String): String = s"$key=${c1TimingSanitize(value)}"
+
+  private def shouldSkipBackendPressureActivationStore(msg: ActivationMessage): Boolean =
+    sys.env.get("C1_BACKEND_PRESSURE_SKIP_ACTIVATION_STORE").contains("1") &&
+      msg.metrics.get("c1_backend_pressure").contains(1L)
+
+  private def guardedStoreActivation(
+    tid: TransactionId,
+    activation: WhiskActivation,
+    msg: ActivationMessage,
+    isBlocking: Boolean,
+    context: UserContext): Future[Any] = {
+    if (shouldSkipBackendPressureActivationStore(msg)) {
+      val fields = Seq(
+        c1TimingField("activation_id", msg.activationId.asString),
+        c1TimingField("tid", tid.id),
+        c1TimingField("namespace", msg.user.namespace.name.asString),
+        c1TimingField("blocking", isBlocking.toString),
+        c1TimingField("status_code", activation.response.statusCode.toString),
+        c1TimingField("reason", "backend_pressure_store_skip"))
+      logging.info(this, s"C1_BACKEND_PRESSURE_SKIP_STORE|${fields.mkString("|")}")(tid)
+      Future.successful(())
+    } else {
+      storeActivation(tid, activation, isBlocking, context)
+    }
+  }
+
+  private def emitC1TimingEvent(eventCode: String, boundaryName: String, msg: ActivationMessage): Unit = {
+    val unixNs = System.currentTimeMillis() * 1000000L
+    val monoNs = System.nanoTime()
+    val fields = Seq(
+      c1TimingField("event_code", eventCode),
+      c1TimingField("activation_id", msg.activationId.asString),
+      c1TimingField("boundary_name", boundaryName),
+      c1TimingField("node", c1TimingNode),
+      c1TimingField("process", "openwhisk_invoker"),
+      c1TimingField("pid", c1TimingProcessId),
+      c1TimingField("tid", msg.transid.id),
+      c1TimingField("unix_ns", unixNs.toString),
+      c1TimingField("mono_ns", monoNs.toString),
+      c1TimingField("clock_domain", "openwhisk_invoker_jvm_mono"))
+    logging.info(this, s"C1TIMING_EVENT|${fields.mkString("|")}")(msg.transid)
+  }
+
+  private def c1InternalRescheduleRequested(parameters: JsValue): Boolean =
+    parameters match {
+      case jsObject: JsObject => jsObject.fields.get("c1_internal_reschedule_requested").contains(JsBoolean(true))
+      case _                  => false
+    }
+
+  private def c1ConsumeInternalRescheduleRequest(msg: ActivationMessage): ActivationMessage =
+    msg.content match {
+      case Some(jsObject: JsObject) =>
+        val consumedFields =
+          (jsObject.fields - "c1_internal_reschedule_requested") +
+            ("c1_internal_reschedule_injected" -> JsBoolean(true))
+        msg.copy(content = Some(JsObject(consumedFields)))
+      case _ => msg
+    }
 
   when(Uninitialized) {
     // pre warm a container (creates a stem cell container)
@@ -971,7 +1043,7 @@ class FunctionPullingContainerProxy(
               msg.rootControllerIndex,
               msg.user.namespace.uuid,
               CombinedCompletionAndResultMessage(transid, activation, instance))
-            storeActivation(msg.transid, activation, msg.blocking, context)
+            guardedStoreActivation(msg.transid, activation, msg, msg.blocking, context)
 
             // in case action is removed container proxy should be terminated
             Future.failed(new IllegalStateException(errMsg))
@@ -1025,7 +1097,12 @@ class FunctionPullingContainerProxy(
       data.resumeRun.msg.user.namespace.uuid,
       CombinedCompletionAndResultMessage(data.resumeRun.msg.transid, activation, instance))
 
-    storeActivation(data.resumeRun.msg.transid, activation, data.resumeRun.msg.blocking, context)
+    guardedStoreActivation(
+      data.resumeRun.msg.transid,
+      activation,
+      data.resumeRun.msg,
+      data.resumeRun.msg.blocking,
+      context)
   }
 
   /**
@@ -1078,8 +1155,12 @@ class FunctionPullingContainerProxy(
           "deadline" -> (Instant.now.toEpochMilli + actionTimeout.toMillis).toString.toJson)) map {
           case (key, value) => "__OW_" + key.toUpperCase -> value
         }
+        emitC1TimingEvent("OW500", "openwhisk_container_initialize_enter", msg)
         container
           .initialize(action.containerInitializer(env ++ owEnv), actionTimeout, action.limits.concurrency.maxConcurrent)
+          .andThen {
+            case _ => emitC1TimingEvent("OW510", "openwhisk_container_initialize_exit", msg)
+          }
           .map(Some(_))
     }
 
@@ -1101,34 +1182,60 @@ class FunctionPullingContainerProxy(
           // but potentially under-estimates actual deadline
           "deadline" -> (Instant.now.toEpochMilli + actionTimeout.toMillis).toString.toJson)
 
-        container
-          .run(
-            parameters,
-            env.toJson.asJsObject,
-            actionTimeout,
-            action.limits.concurrency.maxConcurrent,
-            msg.user.limits.allowedMaxPayloadSize,
-            msg.user.limits.allowedTruncationSize,
-            resumeRun.isDefined)(msg.transid)
+        val activationId = msg.activationId.asString
+        val injectInternalReschedule =
+            c1InternalRescheduleInjectionEnabled &&
+            resumeRun.isDefined &&
+            c1InternalRescheduleRequested(parameters) &&
+            (FunctionPullingContainerProxy.c1InternalRescheduleInjectedActivations
+              .putIfAbsent(activationId, java.lang.Boolean.TRUE) eq null)
+
+        val runResult =
+          if (injectInternalReschedule) {
+            logging.warn(
+              this,
+              s"C1_INTERNAL_RESCHEDULE_INJECTION|activation_id=${c1TimingSanitize(activationId)}|container_id=${c1TimingSanitize(container.containerId.asString)}|reason=$c1InternalRescheduleInjectionReason|status=injected_once")(
+              msg.transid)
+            Future.failed(ContainerHealthError(msg.transid, c1InternalRescheduleInjectionReason))
+          } else {
+            container.run(
+              parameters,
+              env.toJson.asJsObject,
+              actionTimeout,
+              action.limits.concurrency.maxConcurrent,
+              msg.user.limits.allowedMaxPayloadSize,
+              msg.user.limits.allowedTruncationSize,
+              resumeRun.isDefined)(msg.transid)
+          }
+
+        runResult
           .map {
             case (runInterval, response) =>
               val initRunInterval = initInterval
                 .map(i => Interval(runInterval.start.minusMillis(i.duration.toMillis), runInterval.end))
                 .getOrElse(runInterval)
-              constructWhiskActivation(
+              val whiskActivation = constructWhiskActivation(
                 action,
                 msg,
                 initInterval,
                 initRunInterval,
                 runInterval.duration >= actionTimeout,
                 response)
+              emitC1TimingEvent("N700", "native_worker_result_ready", msg)
+              whiskActivation
           }
       }
       .recoverWith {
         case h: ContainerHealthError if resumeRun.isDefined =>
           // health error occurs
           logging.error(this, s"caught healthchek check error while running activation")
-          Future.failed(ContainerHealthErrorWithResumedRun(h.tid, h.msg, resumeRun.get))
+          val resumedRun =
+            if (h.msg == c1InternalRescheduleInjectionReason) {
+              resumeRun.get.copy(msg = c1ConsumeInternalRescheduleRequest(resumeRun.get.msg))
+            } else {
+              resumeRun.get
+            }
+          Future.failed(ContainerHealthErrorWithResumedRun(h.tid, h.msg, resumedRun))
 
         case InitializationError(interval, response) =>
           Future.successful(
@@ -1163,6 +1270,8 @@ class FunctionPullingContainerProxy(
         val ackMsg =
           if (splitAckMessagesPendingLogCollection) ResultMessage(tid, result)
           else CombinedCompletionAndResultMessage(tid, result, instance)
+        emitC1TimingEvent("OW800", "openwhisk_result_notify_submit", msg)
+        emitC1TimingEvent("N800", "native_worker_result_notify_submit", msg)
         sendActiveAck(tid, result, msg.blocking, msg.rootControllerIndex, msg.user.namespace.uuid, ackMsg)
       }
     } else {
@@ -1171,6 +1280,8 @@ class FunctionPullingContainerProxy(
       else
         activation.map { result =>
           val ackMsg = CompletionMessage(tid, result, instance)
+          emitC1TimingEvent("OW800", "openwhisk_result_notify_submit", msg)
+          emitC1TimingEvent("N800", "native_worker_result_notify_submit", msg)
           sendActiveAck(tid, result, msg.blocking, msg.rootControllerIndex, msg.user.namespace.uuid, ackMsg)
         }
     }
@@ -1212,18 +1323,23 @@ class FunctionPullingContainerProxy(
         // (result is received before the completion message for blocking invokes).
         if (splitAckMessagesPendingLogCollection) {
           sendResult.onComplete(
-            _ =>
+            _ => {
+              if (!msg.blocking) {
+                emitC1TimingEvent("OW800", "openwhisk_result_notify_submit", msg)
+                emitC1TimingEvent("N800", "native_worker_result_notify_submit", msg)
+              }
               sendActiveAck(
                 tid,
                 activation,
                 msg.blocking,
                 msg.rootControllerIndex,
                 msg.user.namespace.uuid,
-                CompletionMessage(tid, activation, instance)))
+                CompletionMessage(tid, activation, instance))
+            })
         }
 
         // Storing the record. Entirely asynchronous and not waited upon.
-        storeActivation(tid, activation, msg.blocking, context)
+        guardedStoreActivation(tid, activation, msg, msg.blocking, context)
       }
 
     // Disambiguate activation errors and transform the Either into a failed/successful Future respectively.
@@ -1270,6 +1386,8 @@ class FunctionPullingContainerProxy(
 }
 
 object FunctionPullingContainerProxy {
+  private[containerpool] val c1InternalRescheduleInjectedActivations =
+    new ConcurrentHashMap[String, java.lang.Boolean]
 
   def props(factory: (TransactionId,
                       String,

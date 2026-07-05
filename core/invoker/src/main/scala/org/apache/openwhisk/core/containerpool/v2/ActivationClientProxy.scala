@@ -32,6 +32,7 @@ import org.apache.openwhisk.core.scheduler.queue.{ActionMismatch, MemoryQueueErr
 import org.apache.openwhisk.grpc.{ActivationServiceClient, FetchRequest, RescheduleRequest, RescheduleResponse}
 import spray.json.JsonParser.ParsingException
 
+import java.lang.management.ManagementFactory
 import scala.concurrent.Future
 import scala.util.{Success, Try}
 
@@ -79,6 +80,30 @@ class ActivationClientProxy(
   implicit val ec = actorSystem.dispatcher
 
   private var warmed = false
+  private val c1TimingProcessId = ManagementFactory.getRuntimeMXBean.getName.takeWhile(_ != '@')
+  private val c1TimingNode = sys.env.get("C1_TIMING_NODE_ID").orElse(sys.env.get("HOSTNAME")).getOrElse("")
+
+  private def c1TimingSanitize(value: String): String =
+    value.replace('|', '_').replace('\n', ' ').replace('\r', ' ')
+
+  private def c1TimingField(key: String, value: String): String = s"$key=${c1TimingSanitize(value)}"
+
+  private def emitC1TimingEvent(eventCode: String, boundaryName: String, msg: ActivationMessage): Unit = {
+    val unixNs = System.currentTimeMillis() * 1000000L
+    val monoNs = System.nanoTime()
+    val fields = Seq(
+      c1TimingField("event_code", eventCode),
+      c1TimingField("activation_id", msg.activationId.asString),
+      c1TimingField("boundary_name", boundaryName),
+      c1TimingField("node", c1TimingNode),
+      c1TimingField("process", "openwhisk_invoker"),
+      c1TimingField("pid", c1TimingProcessId),
+      c1TimingField("tid", msg.transid.id),
+      c1TimingField("unix_ns", unixNs.toString),
+      c1TimingField("mono_ns", monoNs.toString),
+      c1TimingField("clock_domain", "openwhisk_invoker_jvm_mono"))
+    logging.info(this, s"C1TIMING_EVENT|${fields.mkString("|")}")(msg.transid)
+  }
 
   startWith(ClientProxyUninitialized, Retry(3))
 
@@ -372,6 +397,8 @@ class ActivationClientProxy(
             .flatMap(Future.fromTry)
             .flatMap {
               case ActivationResponse(Right(msg)) =>
+                emitC1TimingEvent("OW310", "openwhisk_worker_activation_received", msg)
+                emitC1TimingEvent("N300", "native_worker_activation_fetch_received", msg)
                 Future.successful(msg)
               case ActivationResponse(Left(msg)) =>
                 Future.successful(msg)

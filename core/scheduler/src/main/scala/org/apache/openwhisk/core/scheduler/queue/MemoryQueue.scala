@@ -47,6 +47,7 @@ import pureconfig.loadConfigOrThrow
 import spray.json._
 import pureconfig.generic.auto._
 
+import java.lang.management.ManagementFactory
 import scala.collection.JavaConverters._
 import java.time.{Duration, Instant}
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
@@ -180,6 +181,8 @@ class MemoryQueue(private val etcdClient: EtcdClient,
   private[queue] var averageDurationBuffer = AverageRingBuffer(queueConfig.durationBufferSize)
   private[queue] var limit: Option[Int] = None
   private[queue] var initialized = false
+  private val c1TimingProcessId = ManagementFactory.getRuntimeMXBean.getName.takeWhile(_ != '@')
+  private val c1TimingNode = sys.env.get("C1_TIMING_NODE_ID").orElse(sys.env.get("HOSTNAME")).getOrElse("")
 
   private val logScheduler: Cancellable = context.system.scheduler.scheduleWithFixedDelay(0.seconds, 1.seconds) { () =>
     MetricEmitter.emitGaugeMetric(
@@ -204,6 +207,33 @@ class MemoryQueue(private val etcdClient: EtcdClient,
   }
 
   getAverageDuration()
+
+  private def c1TimingSanitize(value: String): String =
+    value.replace('|', '_').replace('\n', ' ').replace('\r', ' ')
+
+  private def c1TimingField(key: String, value: String): String = s"$key=${c1TimingSanitize(value)}"
+
+  private def emitC1TimingEvent(msg: ActivationMessage,
+                                eventCode: String,
+                                boundaryName: String,
+                                deliveryPath: String): Unit = {
+    val unixNs = System.currentTimeMillis() * 1000000L
+    val monoNs = System.nanoTime()
+    val fields = Seq(
+      c1TimingField("event_code", eventCode),
+      c1TimingField("boundary_name", boundaryName),
+      c1TimingField("activation_id", msg.activationId.asString),
+      c1TimingField("transaction_id", msg.transid.id),
+      c1TimingField("delivery_path", deliveryPath),
+      c1TimingField("node", c1TimingNode),
+      c1TimingField("process", "openwhisk_scheduler"),
+      c1TimingField("pid", c1TimingProcessId),
+      c1TimingField("tid", msg.transid.id),
+      c1TimingField("unix_ns", unixNs.toString),
+      c1TimingField("mono_ns", monoNs.toString),
+      c1TimingField("clock_domain", "openwhisk_scheduler_jvm_mono"))
+    logging.info(this, s"C1TIMING_EVENT|${fields.mkString("|")}")(msg.transid)
+  }
 
   private val watcherName = s"memory-queue-$action-$revision"
   // watch existing containers for action and namespace
@@ -1039,6 +1069,7 @@ class MemoryQueue(private val etcdClient: EtcdClient,
     logging.info(this, s"[$invocationNamespace:$action:$stateName] got a new activation message ${msg.activationId}")(
       msg.transid)
     in.incrementAndGet()
+    emitC1TimingEvent(msg, "OW260", "openwhisk_activation_queue_enter", "activation_queue_enter")
     takeUncompletedRequest()
       .map { res =>
         val totalTimeInScheduler = Interval(msg.transid.meta.start, Instant.now()).duration
@@ -1073,6 +1104,7 @@ class MemoryQueue(private val etcdClient: EtcdClient,
         totalTimeInScheduler.toMillis)
       lastActivationPulledTime.set(Instant.now.toEpochMilli)
 
+      emitC1TimingEvent(msg, "OW300", "openwhisk_scheduler_activation_dispatch_exit", "direct_queued_activation_response")
       sender ! GetActivationResponse(Right(msg))
       tryDisableActionThrottling()
     } else {
@@ -1096,6 +1128,11 @@ class MemoryQueue(private val etcdClient: EtcdClient,
     requestBuffer.enqueue(BufferedRequest(warmedFlag + request.containerId, promise))
     promise.future.onComplete {
       case Success(value) =>
+        value match {
+          case Right(msg) =>
+            emitC1TimingEvent(msg, "OW300", "openwhisk_scheduler_activation_dispatch_exit", "waiting_request_success_response")
+          case Left(_) => // do nothing
+        }
         sender ! GetActivationResponse(value)
         value match {
           case Right(msg) =>
