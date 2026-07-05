@@ -32,7 +32,11 @@ import spray.json.DefaultJsonProtocol._
 import org.apache.openwhisk.common.TransactionId
 import org.apache.openwhisk.core.{FeatureFlags, WhiskConfig}
 import org.apache.openwhisk.core.controller.RestApiCommons.{ListLimit, ListSkip}
-import org.apache.openwhisk.core.controller.actions.PostActionActivation
+import org.apache.openwhisk.core.controller.actions.{
+  BackendPressureActivationResult,
+  BackendPressureMetadata,
+  PostActionActivation
+}
 import org.apache.openwhisk.core.database.{ActivationStore, CacheChangeNotification, NoDocumentException}
 import org.apache.openwhisk.core.entitlement._
 import org.apache.openwhisk.core.entity._
@@ -113,6 +117,314 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
 
   /** JSON response formatter. */
   import RestApiCommons.jsonDefaultResponsePrinter
+
+  private case class C1BackendPressureRequest(namespace: String,
+                                              action: String,
+                                              profile: String,
+                                              run_id: String,
+                                              concurrency: Int,
+                                              logical_requests: Int,
+                                              failure_probability: Double,
+                                              payload_bytes: Int,
+                                              workload_id: String,
+                                              request_generation_mode: String,
+                                              target_arrival_rate_per_sec: Double,
+                                              duration_sec: Int,
+                                              planned_logical_requests: Int,
+                                              max_inflight_safety_limit: Int)
+
+  private implicit val c1BackendPressureRequestFormat = jsonFormat14(C1BackendPressureRequest)
+
+  private val c1BackendPressureMode = "controller-internal-queue"
+  private val c1BackendPressureRequestModeOpenLoop = "open_loop_rate"
+  private val c1BackendPressureControllerSourceEnv = "C1_BACKEND_PRESSURE_CONTROLLER_SOURCE"
+  private val c1BackendPressureMaxLogicalRequests = 100000
+  private val c1BackendPressureMaxPayloadBytes = 1048576
+
+  private case class C1BackendPressureOutcome(logicalRequestId: String,
+                                              result: Either[String, BackendPressureActivationResult])
+
+  private def c1BackendPressureControllerSourceEnabled: Boolean =
+    sys.env.get(c1BackendPressureControllerSourceEnv).contains("1")
+
+  private def c1BackendPressureValue(value: String): String =
+    Option(value).getOrElse("").replace('|', '_').replace('\n', ' ').replace('\r', ' ')
+
+  private def validateC1BackendPressureRequest(request: C1BackendPressureRequest): Option[String] = {
+    def errorIf(condition: Boolean, message: String): Option[String] = if (condition) Some(message) else None
+
+    val errors = Seq(
+      errorIf(request.namespace.trim.isEmpty, "namespace is required"),
+      errorIf(request.action.trim.isEmpty, "action is required"),
+      errorIf(request.profile.trim.isEmpty, "profile is required"),
+      errorIf(request.run_id.trim.isEmpty, "run_id is required"),
+      errorIf(request.concurrency <= 0, "concurrency must be positive"),
+      errorIf(request.logical_requests <= 0, "logical_requests must be positive"),
+      errorIf(
+        request.request_generation_mode != c1BackendPressureRequestModeOpenLoop,
+        s"request_generation_mode must be $c1BackendPressureRequestModeOpenLoop"),
+      errorIf(request.target_arrival_rate_per_sec <= 0.0, "target_arrival_rate_per_sec must be positive"),
+      errorIf(request.duration_sec <= 0, "duration_sec must be positive"),
+      errorIf(request.planned_logical_requests <= 0, "planned_logical_requests must be positive"),
+      errorIf(request.max_inflight_safety_limit <= 0, "max_inflight_safety_limit must be positive"),
+      errorIf(
+        request.planned_logical_requests != math.floor(request.target_arrival_rate_per_sec * request.duration_sec).toInt,
+        "planned_logical_requests must equal floor(target_arrival_rate_per_sec * duration_sec)"),
+      errorIf(
+        request.planned_logical_requests > request.max_inflight_safety_limit,
+        "planned_logical_requests must not exceed max_inflight_safety_limit"),
+      errorIf(
+        request.logical_requests != request.planned_logical_requests,
+        "logical_requests must equal planned_logical_requests for open_loop_rate"),
+      errorIf(
+        request.logical_requests > c1BackendPressureMaxLogicalRequests,
+        s"logical_requests must be <= $c1BackendPressureMaxLogicalRequests"),
+      errorIf(request.payload_bytes < 0, "payload_bytes must be non-negative"),
+      errorIf(
+        request.payload_bytes > c1BackendPressureMaxPayloadBytes,
+        s"payload_bytes must be <= $c1BackendPressureMaxPayloadBytes"),
+      errorIf(
+        request.failure_probability < 0.0 || request.failure_probability > 1.0,
+        "failure_probability must be between 0.0 and 1.0"),
+      errorIf(request.workload_id.trim.isEmpty, "workload_id is required")).flatten
+
+    if (errors.isEmpty) None else Some(errors.mkString("; "))
+  }
+
+  private def c1BackendPressurePayload(request: C1BackendPressureRequest, logicalRequestId: Int): JsObject = {
+    JsObject(
+      "collection_id" -> JsString("C1"),
+      "entry_mode" -> JsString(c1BackendPressureMode),
+      "db_store_policy" -> JsString("skipped-for-backend-pressure"),
+      "pressure_source" -> JsString("controller-internal"),
+      "profile" -> JsString(request.profile),
+      "run_id" -> JsString(request.run_id),
+      "logical_request_id" -> JsString(logicalRequestId.toString),
+      "concurrency" -> JsNumber(request.concurrency),
+      "request_generation_mode" -> JsString(request.request_generation_mode),
+      "target_arrival_rate_per_sec" -> JsNumber(request.target_arrival_rate_per_sec),
+      "duration_sec" -> JsNumber(request.duration_sec),
+      "planned_logical_requests" -> JsNumber(request.planned_logical_requests),
+      "max_inflight_safety_limit" -> JsNumber(request.max_inflight_safety_limit),
+      "failure_probability" -> JsNumber(request.failure_probability),
+      "payload_bytes" -> JsNumber(request.payload_bytes),
+      "workload_id" -> JsString(request.workload_id),
+      "payload" -> JsString("x" * request.payload_bytes))
+  }
+
+  private def c1BackendPressureResponse(runId: String,
+                                        submitted: Int,
+                                        completed: Int,
+                                        failed: Int,
+                                        notReady: Int,
+                                        results: Seq[C1BackendPressureOutcome]): JsObject = {
+    val activationIds = results.collect {
+      case C1BackendPressureOutcome(_, Right(result)) => JsString(result.activationId.asString)
+    }.toVector
+    val errors = results.collect {
+      case C1BackendPressureOutcome(_, Left(error)) => JsString(error)
+    }.toVector
+    val statuses = results.map {
+      case C1BackendPressureOutcome(logicalRequestId, Right(result)) =>
+        JsObject(
+          "logical_request_id" -> JsString(logicalRequestId),
+          "activation_id" -> JsString(result.activationId.asString),
+          "status" -> JsString(result.status),
+          "reason" -> JsString(result.reason))
+      case C1BackendPressureOutcome(logicalRequestId, Left(error)) =>
+        JsObject(
+          "logical_request_id" -> JsString(logicalRequestId),
+          "status" -> JsString(BackendPressureActivationResult.Failed),
+          "reason" -> JsString(error))
+    }.toVector
+
+    JsObject(
+      "mode" -> JsString(c1BackendPressureMode),
+      "run_id" -> JsString(runId),
+      "request_generation_mode" -> JsString(c1BackendPressureRequestModeOpenLoop),
+      "submitted" -> JsNumber(submitted),
+      "completed" -> JsNumber(completed),
+      "failed" -> JsNumber(failed),
+      "not_ready" -> JsNumber(notReady),
+      "activation_ids" -> JsArray(activationIds),
+      "errors" -> JsArray(errors),
+      "statuses" -> JsArray(statuses))
+  }
+
+  private def c1BackendPressureStatusDetail(runId: String,
+                                            logicalRequestId: String,
+                                            status: String,
+                                            reason: String,
+                                            activationId: Option[ActivationId] = None)(
+    implicit transid: TransactionId): Unit = {
+    val fields = Seq(
+      Some("run_id" -> runId),
+      Some("logical_request_id" -> logicalRequestId),
+      activationId.map(id => "activation_id" -> id.asString),
+      Some("status" -> status),
+      Some("reason" -> reason),
+      Some("mode" -> c1BackendPressureMode)).flatten.map {
+      case (key, value) => s"$key=${c1BackendPressureValue(value)}"
+    }
+    logging.info(this, s"C1_BACKEND_PRESSURE_STATUS_DETAIL|${fields.mkString("|")}")
+  }
+
+  private def c1BackendPressureInvoke(user: Identity,
+                                      action: WhiskActionMetaData,
+                                      request: C1BackendPressureRequest,
+                                      logicalRequestId: Int,
+                                      plannedSubmitMonoNs: Long,
+                                      actualSubmitMonoNs: Long,
+                                      sourceScheduleLagNs: Long)(
+    implicit transid: TransactionId): Future[C1BackendPressureOutcome] = {
+    val logicalRequestIdString = logicalRequestId.toString
+    val metadata = BackendPressureMetadata(
+      runId = request.run_id,
+      logicalRequestId = logicalRequestIdString,
+      profile = request.profile,
+      concurrency = request.concurrency,
+      requestGenerationMode = request.request_generation_mode,
+      targetArrivalRatePerSec = request.target_arrival_rate_per_sec,
+      durationSec = request.duration_sec,
+      plannedLogicalRequests = request.planned_logical_requests,
+      plannedSubmitMonoNs = plannedSubmitMonoNs,
+      actualSubmitMonoNs = actualSubmitMonoNs,
+      sourceScheduleLagNs = sourceScheduleLagNs)
+
+    invokeBackendPressureAction(user, action, Some(c1BackendPressurePayload(request, logicalRequestId)), metadata)
+      .map { result =>
+        if (!result.completed) {
+          c1BackendPressureStatusDetail(
+            request.run_id,
+            logicalRequestIdString,
+            result.status,
+            result.reason,
+            Some(result.activationId))
+        }
+        C1BackendPressureOutcome(logicalRequestIdString, Right(result))
+      }
+      .recover {
+        case t: Throwable =>
+          val reason = c1BackendPressureValue(t.getMessage)
+          c1BackendPressureStatusDetail(
+            request.run_id,
+            logicalRequestIdString,
+            BackendPressureActivationResult.Failed,
+            reason)
+          C1BackendPressureOutcome(logicalRequestIdString, Left(reason))
+      }
+  }
+
+  private def waitUntilMonoNs(plannedSubmitMonoNs: Long): Future[Unit] = {
+    val delayNs = plannedSubmitMonoNs - System.nanoTime()
+    if (delayNs > 0) {
+      org.apache.pekko.pattern.after(delayNs.nanos, actorSystem.scheduler)(Future.successful(()))
+    } else {
+      Future.successful(())
+    }
+  }
+
+  private def runC1BackendPressureOpenLoopRate(user: Identity,
+                                               action: WhiskActionMetaData,
+                                               request: C1BackendPressureRequest)(
+    implicit transid: TransactionId): Future[Vector[C1BackendPressureOutcome]] = {
+    val runStartMonoNs = System.nanoTime()
+    val logicalRequestIds = (1 to request.planned_logical_requests).toVector
+    val scheduled = logicalRequestIds.map { logicalRequestId =>
+      val plannedSubmitMonoNs =
+        runStartMonoNs + math.floor((logicalRequestId - 1).toDouble * 1000000000.0 / request.target_arrival_rate_per_sec).toLong
+      waitUntilMonoNs(plannedSubmitMonoNs).flatMap { _ =>
+        val actualSubmitMonoNs = System.nanoTime()
+        val sourceScheduleLagNs = math.max(0L, actualSubmitMonoNs - plannedSubmitMonoNs)
+        c1BackendPressureInvoke(
+          user,
+          action,
+          request,
+          logicalRequestId,
+          plannedSubmitMonoNs,
+          actualSubmitMonoNs,
+          sourceScheduleLagNs)
+        }
+    }
+    Future.sequence(scheduled)
+  }
+
+  def backendPressureRoutes(user: Identity)(implicit transid: TransactionId) = {
+    (path("c1" / "backend-pressure") & post) {
+      if (!c1BackendPressureControllerSourceEnabled) {
+        terminate(
+          Forbidden,
+          s"C1 backend-pressure controller source is not enabled; set $c1BackendPressureControllerSourceEnv=1")
+      } else {
+        entity(as[C1BackendPressureRequest]) { request =>
+          validateC1BackendPressureRequest(request) match {
+            case Some(error) =>
+              terminate(BadRequest, error)
+            case None =>
+              val namespace = Try(EntityName(request.namespace))
+              val entityName = namespace.toOption.flatMap { ns =>
+                FullyQualifiedEntityName.resolveName(JsString(request.action), ns)
+              }
+
+              entityName match {
+                case None =>
+                  terminate(BadRequest, "namespace or action is malformed")
+                case Some(name) =>
+                  getEntity(WhiskActionMetaData.resolveActionAndMergeParameters(entityStore, name), Some {
+                    actionMetaData: WhiskActionMetaData =>
+                      val action = actionMetaData.resolve(user.namespace)
+                      val resource = Resource(name.path, collection, Some(name.name.asString))
+                      val checks = for {
+                        _ <- entitlementProvider.check(user, Privilege.ACTIVATE, resource)
+                        _ <- entitleReferencedEntitiesMetaData(user, Privilege.ACTIVATE, Some(action.exec))
+                      } yield ()
+
+                      onComplete(checks) {
+                        case Success(_) =>
+                          val submitted = request.planned_logical_requests
+                          onComplete(runC1BackendPressureOpenLoopRate(user, action, request)) {
+                            case Success(results) =>
+                              val completed = results.count {
+                                case C1BackendPressureOutcome(_, Right(result)) => result.completed
+                                case _                                          => false
+                              }
+                              val failed = results.count {
+                                case C1BackendPressureOutcome(_, Right(result)) => result.failed
+                                case C1BackendPressureOutcome(_, Left(_))       => true
+                              }
+                              val notReady = results.count {
+                                case C1BackendPressureOutcome(_, Right(result)) => result.notReady
+                                case _                                          => false
+                              }
+                              logging.info(
+                                this,
+                                s"C1_BACKEND_PRESSURE_STATUS|run_id=${c1BackendPressureValue(request.run_id)}|submitted=$submitted|completed=$completed|failed=$failed|not_ready=$notReady|mode=$c1BackendPressureMode")
+                              complete(
+                                OK,
+                                c1BackendPressureResponse(
+                                  request.run_id,
+                                  submitted,
+                                  completed,
+                                  failed,
+                                  notReady,
+                                  results))
+                            case Failure(t) =>
+                              logging.info(
+                                this,
+                                s"C1_BACKEND_PRESSURE_STATUS|run_id=${c1BackendPressureValue(request.run_id)}|submitted=$submitted|completed=0|failed=$submitted|not_ready=0|mode=$c1BackendPressureMode")
+                              terminate(InternalServerError, t.getMessage)
+                          }
+
+                        case Failure(f) =>
+                          super.handleEntitlementFailure(f)
+                      }
+                  })
+              }
+          }
+        }
+      }
+    }
+  }
 
   /**
    * Handles operations on action resources, which encompass these cases:
