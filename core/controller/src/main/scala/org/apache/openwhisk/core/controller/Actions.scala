@@ -133,7 +133,11 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                               planned_logical_requests: Int,
                                               max_inflight_safety_limit: Int,
                                               ramp_rate_schedule_per_sec: Option[Vector[Double]] = None,
-                                              ramp_stage_duration_sec: Option[Int] = None)
+                                              ramp_stage_duration_sec: Option[Int] = None,
+                                              stage_gate_policy_id: Option[String] = None,
+                                              stage_gate_source_submit_failure_limit: Option[Int] = None,
+                                              stage_gate_source_schedule_lag_p95_ms: Option[Double] = None,
+                                              stage_gate_source_schedule_lag_max_ms: Option[Double] = None)
 
   private implicit object C1BackendPressureRequestFormat extends RootJsonFormat[C1BackendPressureRequest] {
     private def required[T](fields: Map[String, JsValue], name: String)(implicit reader: JsonReader[T]): T =
@@ -164,7 +168,11 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         planned_logical_requests = required[Int](fields, "planned_logical_requests"),
         max_inflight_safety_limit = required[Int](fields, "max_inflight_safety_limit"),
         ramp_rate_schedule_per_sec = optional[Vector[Double]](fields, "ramp_rate_schedule_per_sec"),
-        ramp_stage_duration_sec = optional[Int](fields, "ramp_stage_duration_sec"))
+        ramp_stage_duration_sec = optional[Int](fields, "ramp_stage_duration_sec"),
+        stage_gate_policy_id = optional[String](fields, "stage_gate_policy_id"),
+        stage_gate_source_submit_failure_limit = optional[Int](fields, "stage_gate_source_submit_failure_limit"),
+        stage_gate_source_schedule_lag_p95_ms = optional[Double](fields, "stage_gate_source_schedule_lag_p95_ms"),
+        stage_gate_source_schedule_lag_max_ms = optional[Double](fields, "stage_gate_source_schedule_lag_max_ms"))
     }
 
     override def write(request: C1BackendPressureRequest): JsValue = {
@@ -185,7 +193,11 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         request.target_arrival_rate_per_sec.map("target_arrival_rate_per_sec" -> JsNumber(_)),
         request.duration_sec.map("duration_sec" -> JsNumber(_)),
         request.ramp_rate_schedule_per_sec.map(rates => "ramp_rate_schedule_per_sec" -> JsArray(rates.map(JsNumber(_)))),
-        request.ramp_stage_duration_sec.map("ramp_stage_duration_sec" -> JsNumber(_))).flatten.toMap
+        request.ramp_stage_duration_sec.map("ramp_stage_duration_sec" -> JsNumber(_)),
+        request.stage_gate_policy_id.map("stage_gate_policy_id" -> JsString(_)),
+        request.stage_gate_source_submit_failure_limit.map("stage_gate_source_submit_failure_limit" -> JsNumber(_)),
+        request.stage_gate_source_schedule_lag_p95_ms.map("stage_gate_source_schedule_lag_p95_ms" -> JsNumber(_)),
+        request.stage_gate_source_schedule_lag_max_ms.map("stage_gate_source_schedule_lag_max_ms" -> JsNumber(_))).flatten.toMap
       JsObject(baseFields ++ optionalFields)
     }
   }
@@ -193,12 +205,15 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
   private val c1BackendPressureMode = "controller-internal-queue"
   private val c1BackendPressureRequestModeOpenLoop = "open_loop_rate"
   private val c1BackendPressureRequestModeRamp = "open_loop_ramp"
+  private val c1BackendPressureRequestModeStageGatedRamp = "open_loop_stage_gated_ramp"
+  private val c1BackendPressureStageGatePolicySourceLagV1 = "source_lag_v1"
   private val c1BackendPressureControllerSourceEnv = "C1_BACKEND_PRESSURE_CONTROLLER_SOURCE"
   private val c1BackendPressureMaxLogicalRequests = 100000
   private val c1BackendPressureMaxPayloadBytes = 1048576
 
   private case class C1BackendPressureOutcome(logicalRequestId: String,
-                                              result: Either[String, BackendPressureActivationResult])
+                                              result: Either[String, BackendPressureActivationResult],
+                                              sourceScheduleLagNs: Long)
 
   private case class C1BackendPressureScheduleEntry(logicalRequestId: Int,
                                                     plannedSubmitOffsetNs: Long,
@@ -231,21 +246,56 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             request.logical_requests != request.planned_logical_requests,
             "logical_requests must equal planned_logical_requests for open_loop_rate"),
           errorIf(request.ramp_rate_schedule_per_sec.exists(_.nonEmpty), "ramp_rate_schedule_per_sec is only valid for open_loop_ramp"),
-          errorIf(request.ramp_stage_duration_sec.nonEmpty, "ramp_stage_duration_sec is only valid for open_loop_ramp"))
-      case `c1BackendPressureRequestModeRamp` =>
+          errorIf(request.ramp_stage_duration_sec.nonEmpty, "ramp_stage_duration_sec is only valid for open_loop_ramp"),
+          errorIf(request.stage_gate_policy_id.nonEmpty, "stage_gate_policy_id is only valid for open_loop_stage_gated_ramp"),
+          errorIf(
+            request.stage_gate_source_submit_failure_limit.nonEmpty,
+            "stage_gate_source_submit_failure_limit is only valid for open_loop_stage_gated_ramp"),
+          errorIf(
+            request.stage_gate_source_schedule_lag_p95_ms.nonEmpty,
+            "stage_gate_source_schedule_lag_p95_ms is only valid for open_loop_stage_gated_ramp"),
+          errorIf(
+            request.stage_gate_source_schedule_lag_max_ms.nonEmpty,
+            "stage_gate_source_schedule_lag_max_ms is only valid for open_loop_stage_gated_ramp"))
+      case `c1BackendPressureRequestModeRamp` | `c1BackendPressureRequestModeStageGatedRamp` =>
         val schedule = request.ramp_rate_schedule_per_sec.getOrElse(Vector.empty)
         val stageDuration = request.ramp_stage_duration_sec.getOrElse(0)
         val planned = schedule.map(rate => math.floor(rate * stageDuration).toInt).sum
+        val isStageGated = request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp
         Seq(
-          errorIf(schedule.isEmpty, "ramp_rate_schedule_per_sec is required for open_loop_ramp"),
+          errorIf(schedule.isEmpty, s"ramp_rate_schedule_per_sec is required for ${request.request_generation_mode}"),
           errorIf(schedule.exists(_ <= 0.0), "ramp_rate_schedule_per_sec values must be positive"),
           errorIf(stageDuration <= 0, "ramp_stage_duration_sec must be positive"),
           errorIf(planned != request.planned_logical_requests, "planned_logical_requests must equal sum floor(ramp_rate * ramp_stage_duration_sec)"),
           errorIf(
             request.logical_requests != request.planned_logical_requests,
-            "logical_requests must equal planned_logical_requests for open_loop_ramp"))
+            s"logical_requests must equal planned_logical_requests for ${request.request_generation_mode}"),
+          errorIf(
+            isStageGated && request.stage_gate_policy_id.getOrElse("") != c1BackendPressureStageGatePolicySourceLagV1,
+            s"stage_gate_policy_id must be $c1BackendPressureStageGatePolicySourceLagV1 for $c1BackendPressureRequestModeStageGatedRamp"),
+          errorIf(
+            isStageGated && request.stage_gate_source_submit_failure_limit.exists(_ < 0),
+            "stage_gate_source_submit_failure_limit must be non-negative"),
+          errorIf(
+            isStageGated && request.stage_gate_source_schedule_lag_p95_ms.exists(_ < 0.0),
+            "stage_gate_source_schedule_lag_p95_ms must be non-negative"),
+          errorIf(
+            isStageGated && request.stage_gate_source_schedule_lag_max_ms.exists(_ < 0.0),
+            "stage_gate_source_schedule_lag_max_ms must be non-negative"),
+          errorIf(
+            !isStageGated && request.stage_gate_policy_id.nonEmpty,
+            "stage_gate_policy_id is only valid for open_loop_stage_gated_ramp"),
+          errorIf(
+            !isStageGated && request.stage_gate_source_submit_failure_limit.nonEmpty,
+            "stage_gate_source_submit_failure_limit is only valid for open_loop_stage_gated_ramp"),
+          errorIf(
+            !isStageGated && request.stage_gate_source_schedule_lag_p95_ms.nonEmpty,
+            "stage_gate_source_schedule_lag_p95_ms is only valid for open_loop_stage_gated_ramp"),
+          errorIf(
+            !isStageGated && request.stage_gate_source_schedule_lag_max_ms.nonEmpty,
+            "stage_gate_source_schedule_lag_max_ms is only valid for open_loop_stage_gated_ramp"))
       case _ =>
-        Seq(Some(s"request_generation_mode must be $c1BackendPressureRequestModeOpenLoop or $c1BackendPressureRequestModeRamp"))
+        Seq(Some(s"request_generation_mode must be $c1BackendPressureRequestModeOpenLoop, $c1BackendPressureRequestModeRamp, or $c1BackendPressureRequestModeStageGatedRamp"))
     }
 
     val errors = Seq(
@@ -316,19 +366,19 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                         notReady: Int,
                                         results: Seq[C1BackendPressureOutcome]): JsObject = {
     val activationIds = results.collect {
-      case C1BackendPressureOutcome(_, Right(result)) => JsString(result.activationId.asString)
+      case C1BackendPressureOutcome(_, Right(result), _) => JsString(result.activationId.asString)
     }.toVector
     val errors = results.collect {
-      case C1BackendPressureOutcome(_, Left(error)) => JsString(error)
+      case C1BackendPressureOutcome(_, Left(error), _) => JsString(error)
     }.toVector
     val statuses = results.map {
-      case C1BackendPressureOutcome(logicalRequestId, Right(result)) =>
+      case C1BackendPressureOutcome(logicalRequestId, Right(result), _) =>
         JsObject(
           "logical_request_id" -> JsString(logicalRequestId),
           "activation_id" -> JsString(result.activationId.asString),
           "status" -> JsString(result.status),
           "reason" -> JsString(result.reason))
-      case C1BackendPressureOutcome(logicalRequestId, Left(error)) =>
+      case C1BackendPressureOutcome(logicalRequestId, Left(error), _) =>
         JsObject(
           "logical_request_id" -> JsString(logicalRequestId),
           "status" -> JsString(BackendPressureActivationResult.Failed),
@@ -368,6 +418,65 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
     logging.info(
       this,
       s"C1_BACKEND_PRESSURE_STATUS|run_id=${c1BackendPressureValue(runId)}|submitted=$submitted|completed=$completed|failed=$failed|not_ready=$notReady|mode=$c1BackendPressureMode")
+  }
+
+  private def emitC1BackendPressureStageDecision(request: C1BackendPressureRequest,
+                                                 stageIndex: Int,
+                                                 stageRatePerSec: Double,
+                                                 stageStartOffsetNs: Long,
+                                                 stageEndOffsetNs: Long,
+                                                 stagePlannedRequests: Int,
+                                                 stageSubmitted: Int,
+                                                 stageSourceSubmitFailed: Int,
+                                                 stageActiveAckFailed: Int,
+                                                 stageActiveAckNotReady: Int,
+                                                 sourceScheduleLagP50Ns: Long,
+                                                 sourceScheduleLagP95Ns: Long,
+                                                 sourceScheduleLagMaxNs: Long,
+                                                 decision: String,
+                                                 decisionReason: String,
+                                                 nextStageIndex: Option[Int]): Unit = {
+    val fields = Seq(
+      "run_id" -> request.run_id,
+      "request_generation_mode" -> request.request_generation_mode,
+      "stage_gate_policy_id" -> request.stage_gate_policy_id.getOrElse(""),
+      "ramp_stage_index" -> stageIndex.toString,
+      "ramp_stage_rate_per_sec" -> stageRatePerSec.toString,
+      "ramp_stage_start_offset_ns" -> stageStartOffsetNs.toString,
+      "ramp_stage_end_offset_ns" -> stageEndOffsetNs.toString,
+      "stage_planned_logical_requests" -> stagePlannedRequests.toString,
+      "stage_submitted" -> stageSubmitted.toString,
+      "stage_source_submit_failed" -> stageSourceSubmitFailed.toString,
+      "stage_active_ack_failed" -> stageActiveAckFailed.toString,
+      "stage_active_ack_not_ready" -> stageActiveAckNotReady.toString,
+      "source_schedule_lag_p50_ns" -> sourceScheduleLagP50Ns.toString,
+      "source_schedule_lag_p95_ns" -> sourceScheduleLagP95Ns.toString,
+      "source_schedule_lag_max_ns" -> sourceScheduleLagMaxNs.toString,
+      "decision" -> decision,
+      "decision_reason" -> decisionReason,
+      "next_ramp_stage_index" -> nextStageIndex.map(_.toString).getOrElse("")).map {
+      case (key, value) => s"$key=${c1BackendPressureValue(value)}"
+    }
+    logging.info(this, s"C1_BACKEND_PRESSURE_STAGE_DECISION|${fields.mkString("|")}")
+  }
+
+  private def emitC1BackendPressureRunDecision(request: C1BackendPressureRequest,
+                                               finalSubmittedLogicalRequests: Int,
+                                               finalStageIndex: Int,
+                                               finalDecision: String,
+                                               finalDecisionReason: String): Unit = {
+    val fields = Seq(
+      "run_id" -> request.run_id,
+      "request_generation_mode" -> request.request_generation_mode,
+      "stage_gate_policy_id" -> request.stage_gate_policy_id.getOrElse(""),
+      "candidate_planned_logical_requests" -> request.planned_logical_requests.toString,
+      "final_submitted_logical_requests" -> finalSubmittedLogicalRequests.toString,
+      "final_stage_index" -> finalStageIndex.toString,
+      "final_decision" -> finalDecision,
+      "final_decision_reason" -> finalDecisionReason).map {
+      case (key, value) => s"$key=${c1BackendPressureValue(value)}"
+    }
+    logging.info(this, s"C1_BACKEND_PRESSURE_RUN_DECISION|${fields.mkString("|")}")
   }
 
   private def c1BackendPressureStatusDetail(runId: String,
@@ -427,7 +536,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             result.reason,
             Some(result.activationId))(logicalTransid)
         }
-        C1BackendPressureOutcome(logicalRequestIdString, Right(result))
+        C1BackendPressureOutcome(logicalRequestIdString, Right(result), sourceScheduleLagNs)
       }
       .recover {
         case t: Throwable =>
@@ -437,7 +546,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             logicalRequestIdString,
             BackendPressureActivationResult.Failed,
             reason)(logicalTransid)
-          C1BackendPressureOutcome(logicalRequestIdString, Left(reason))
+          C1BackendPressureOutcome(logicalRequestIdString, Left(reason), sourceScheduleLagNs)
       }
   }
 
@@ -496,7 +605,15 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                            request: C1BackendPressureRequest,
                                            schedule: Vector[C1BackendPressureScheduleEntry])(
     implicit transid: TransactionId): Future[Vector[C1BackendPressureOutcome]] = {
-    val runStartMonoNs = System.nanoTime()
+    runC1BackendPressureScheduleFrom(System.nanoTime(), user, action, request, schedule)
+  }
+
+  private def runC1BackendPressureScheduleFrom(runStartMonoNs: Long,
+                                               user: Identity,
+                                               action: WhiskActionMetaData,
+                                               request: C1BackendPressureRequest,
+                                               schedule: Vector[C1BackendPressureScheduleEntry])(
+    implicit transid: TransactionId): Future[Vector[C1BackendPressureOutcome]] = {
     val scheduled = schedule.map { scheduleEntry =>
       val plannedSubmitMonoNs = runStartMonoNs + scheduleEntry.plannedSubmitOffsetNs
       waitUntilMonoNs(plannedSubmitMonoNs).flatMap { _ =>
@@ -515,6 +632,38 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
     Future.sequence(scheduled)
   }
 
+  private def percentileNs(values: Vector[Long], percentile: Double): Long = {
+    if (values.isEmpty) {
+      0L
+    } else {
+      val sorted = values.sorted
+      val index = math.max(0, math.ceil(percentile * sorted.size).toInt - 1)
+      sorted(math.min(index, sorted.size - 1))
+    }
+  }
+
+  private def stageGateFailureLimit(request: C1BackendPressureRequest, stagePlannedRequests: Int): Int =
+    request.stage_gate_source_submit_failure_limit.getOrElse(math.max(100, math.floor(stagePlannedRequests * 0.01).toInt))
+
+  private def stageGateDecisionReason(request: C1BackendPressureRequest,
+                                      stagePlannedRequests: Int,
+                                      stageSourceSubmitFailed: Int,
+                                      sourceScheduleLagP95Ns: Long,
+                                      sourceScheduleLagMaxNs: Long): Option[String] = {
+    val sourceSubmitFailureLimit = stageGateFailureLimit(request, stagePlannedRequests)
+    val p95LimitNs = math.round(request.stage_gate_source_schedule_lag_p95_ms.getOrElse(1000.0) * 1000000.0)
+    val maxLimitNs = math.round(request.stage_gate_source_schedule_lag_max_ms.getOrElse(5000.0) * 1000000.0)
+    if (stageSourceSubmitFailed > sourceSubmitFailureLimit) {
+      Some(s"source_submit_failed_gt_$sourceSubmitFailureLimit")
+    } else if (sourceScheduleLagP95Ns > p95LimitNs) {
+      Some(s"source_schedule_lag_p95_gt_${p95LimitNs}_ns")
+    } else if (sourceScheduleLagMaxNs > maxLimitNs) {
+      Some(s"source_schedule_lag_max_gt_${maxLimitNs}_ns")
+    } else {
+      None
+    }
+  }
+
   private def runC1BackendPressureOpenLoopRate(user: Identity,
                                                action: WhiskActionMetaData,
                                                request: C1BackendPressureRequest)(
@@ -526,6 +675,85 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                                request: C1BackendPressureRequest)(
     implicit transid: TransactionId): Future[Vector[C1BackendPressureOutcome]] =
     runC1BackendPressureSchedule(user, action, request, c1BackendPressureOpenLoopRampSchedule(request))
+
+  private def runC1BackendPressureStageGatedRamp(user: Identity,
+                                                 action: WhiskActionMetaData,
+                                                 request: C1BackendPressureRequest)(
+    implicit transid: TransactionId): Future[Vector[C1BackendPressureOutcome]] = {
+    val runStartMonoNs = System.nanoTime()
+    val stages = c1BackendPressureOpenLoopRampSchedule(request)
+      .groupBy(_.rampStageIndex.getOrElse(0))
+      .toVector
+      .map { case (stageIndex, entries) => stageIndex -> entries.sortBy(_.logicalRequestId) }
+      .sortBy(_._1)
+
+    def loop(remaining: Vector[(Int, Vector[C1BackendPressureScheduleEntry])],
+             accumulated: Vector[C1BackendPressureOutcome]): Future[Vector[C1BackendPressureOutcome]] = {
+      remaining.headOption match {
+        case None =>
+          emitC1BackendPressureRunDecision(request, accumulated.size, 0, "complete", "no_stages")
+          Future.successful(accumulated)
+        case Some((stageIndex, stageEntries)) =>
+          runC1BackendPressureScheduleFrom(runStartMonoNs, user, action, request, stageEntries).flatMap { stageResults =>
+            val stagePlannedRequests = stageEntries.size
+            val stageSubmitted = stageResults.size
+            val stageSourceSubmitFailed = stageResults.count(_.result.isLeft)
+            val stageActiveAckFailed = stageResults.count {
+              case C1BackendPressureOutcome(_, Right(result), _) => result.failed
+              case _                                             => false
+            }
+            val stageActiveAckNotReady = stageResults.count {
+              case C1BackendPressureOutcome(_, Right(result), _) => result.notReady
+              case _                                             => false
+            }
+            val lags = stageResults.map(_.sourceScheduleLagNs)
+            val lagP50 = percentileNs(lags, 0.50)
+            val lagP95 = percentileNs(lags, 0.95)
+            val lagMax = if (lags.isEmpty) 0L else lags.max
+            val stopReason = stageGateDecisionReason(
+              request,
+              stagePlannedRequests,
+              stageSourceSubmitFailed,
+              lagP95,
+              lagMax)
+            val isLastStage = remaining.size == 1
+            val decision = if (stopReason.nonEmpty || isLastStage) "stop" else "continue"
+            val decisionReason = stopReason.getOrElse(if (isLastStage) "candidate_schedule_complete" else "source_lag_v1_ok")
+            val nextStageIndex = if (decision == "continue") remaining.drop(1).headOption.map(_._1) else None
+            val firstEntry = stageEntries.head
+            emitC1BackendPressureStageDecision(
+              request,
+              stageIndex,
+              firstEntry.rampStageRatePerSec.getOrElse(0.0),
+              firstEntry.rampStageStartOffsetNs.getOrElse(0L),
+              firstEntry.rampStageEndOffsetNs.getOrElse(0L),
+              stagePlannedRequests,
+              stageSubmitted,
+              stageSourceSubmitFailed,
+              stageActiveAckFailed,
+              stageActiveAckNotReady,
+              lagP50,
+              lagP95,
+              lagMax,
+              decision,
+              decisionReason,
+              nextStageIndex)
+
+            val nextAccumulated = accumulated ++ stageResults
+            if (decision == "continue") {
+              loop(remaining.drop(1), nextAccumulated)
+            } else {
+              val finalDecision =
+                if (stopReason.nonEmpty) "stopped_by_gate" else "complete"
+              emitC1BackendPressureRunDecision(request, nextAccumulated.size, stageIndex, finalDecision, decisionReason)
+              Future.successful(nextAccumulated)
+            }
+          }
+      }
+    }
+
+    loop(stages, Vector.empty)
+  }
 
   def backendPressureRoutes(user: Identity)(implicit transid: TransactionId) = {
     (path("c1" / "backend-pressure") & post) {
@@ -560,24 +788,40 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                       onComplete(checks) {
                         case Success(_) =>
                           val submitted = request.planned_logical_requests
-                          if (request.request_generation_mode == c1BackendPressureRequestModeRamp) {
-                            val run = runC1BackendPressureOpenLoopRamp(user, action, request)
+                          if (
+                            request.request_generation_mode == c1BackendPressureRequestModeRamp ||
+                            request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp) {
+                            val run =
+                              if (request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp) {
+                                runC1BackendPressureStageGatedRamp(user, action, request)
+                              } else {
+                                runC1BackendPressureOpenLoopRamp(user, action, request)
+                              }
                             run.onComplete {
                               case Success(results) =>
                                 val completed = results.count {
-                                  case C1BackendPressureOutcome(_, Right(result)) => result.completed
+                                  case C1BackendPressureOutcome(_, Right(result), _) => result.completed
                                   case _                                          => false
                                 }
                                 val failed = results.count {
-                                  case C1BackendPressureOutcome(_, Right(result)) => result.failed
-                                  case C1BackendPressureOutcome(_, Left(_))       => true
+                                  case C1BackendPressureOutcome(_, Right(result), _) => result.failed
+                                  case C1BackendPressureOutcome(_, Left(_), _)       => true
                                 }
                                 val notReady = results.count {
-                                  case C1BackendPressureOutcome(_, Right(result)) => result.notReady
+                                  case C1BackendPressureOutcome(_, Right(result), _) => result.notReady
                                   case _                                          => false
                                 }
-                                emitC1BackendPressureStatus(request.run_id, submitted, completed, failed, notReady)
+                                val finalSubmitted =
+                                  if (request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp) {
+                                    results.size
+                                  } else {
+                                    submitted
+                                  }
+                                emitC1BackendPressureStatus(request.run_id, finalSubmitted, completed, failed, notReady)
                               case Failure(_) =>
+                                if (request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp) {
+                                  emitC1BackendPressureRunDecision(request, 0, 0, "aborted", "controller_background_failure")
+                                }
                                 emitC1BackendPressureStatus(request.run_id, submitted, 0, submitted, 0)
                             }
                             complete(Accepted, c1BackendPressureAckResponse(request, submitted))
@@ -586,15 +830,15 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                             onComplete(run) {
                               case Success(results) =>
                                 val completed = results.count {
-                                  case C1BackendPressureOutcome(_, Right(result)) => result.completed
+                                  case C1BackendPressureOutcome(_, Right(result), _) => result.completed
                                   case _                                          => false
                                 }
                                 val failed = results.count {
-                                  case C1BackendPressureOutcome(_, Right(result)) => result.failed
-                                  case C1BackendPressureOutcome(_, Left(_))       => true
+                                  case C1BackendPressureOutcome(_, Right(result), _) => result.failed
+                                  case C1BackendPressureOutcome(_, Left(_), _)       => true
                                 }
                                 val notReady = results.count {
-                                  case C1BackendPressureOutcome(_, Right(result)) => result.notReady
+                                  case C1BackendPressureOutcome(_, Right(result), _) => result.notReady
                                   case _                                          => false
                                 }
                                 emitC1BackendPressureStatus(request.run_id, submitted, completed, failed, notReady)
