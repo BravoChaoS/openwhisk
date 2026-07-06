@@ -348,6 +348,28 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       "statuses" -> JsArray(statuses))
   }
 
+  private def c1BackendPressureAckResponse(request: C1BackendPressureRequest, submitted: Int): JsObject = {
+    JsObject(
+      "accepted" -> JsBoolean(true),
+      "mode" -> JsString(c1BackendPressureMode),
+      "run_id" -> JsString(request.run_id),
+      "request_generation_mode" -> JsString(request.request_generation_mode),
+      "response_model" -> JsString("ack_durable_logs"),
+      "durable_data_source" -> JsString("controller_filtered_logs"),
+      "submitted" -> JsNumber(submitted),
+      "planned_logical_requests" -> JsNumber(request.planned_logical_requests))
+  }
+
+  private def emitC1BackendPressureStatus(runId: String,
+                                          submitted: Int,
+                                          completed: Int,
+                                          failed: Int,
+                                          notReady: Int): Unit = {
+    logging.info(
+      this,
+      s"C1_BACKEND_PRESSURE_STATUS|run_id=${c1BackendPressureValue(runId)}|submitted=$submitted|completed=$completed|failed=$failed|not_ready=$notReady|mode=$c1BackendPressureMode")
+  }
+
   private def c1BackendPressureStatusDetail(runId: String,
                                             logicalRequestId: String,
                                             status: String,
@@ -538,44 +560,58 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                       onComplete(checks) {
                         case Success(_) =>
                           val submitted = request.planned_logical_requests
-                          val run = request.request_generation_mode match {
-                            case `c1BackendPressureRequestModeRamp` =>
-                              runC1BackendPressureOpenLoopRamp(user, action, request)
-                            case _ =>
-                              runC1BackendPressureOpenLoopRate(user, action, request)
-                          }
-                          onComplete(run) {
-                            case Success(results) =>
-                              val completed = results.count {
-                                case C1BackendPressureOutcome(_, Right(result)) => result.completed
-                                case _                                          => false
-                              }
-                              val failed = results.count {
-                                case C1BackendPressureOutcome(_, Right(result)) => result.failed
-                                case C1BackendPressureOutcome(_, Left(_))       => true
-                              }
-                              val notReady = results.count {
-                                case C1BackendPressureOutcome(_, Right(result)) => result.notReady
-                                case _                                          => false
-                              }
-                              logging.info(
-                                this,
-                                s"C1_BACKEND_PRESSURE_STATUS|run_id=${c1BackendPressureValue(request.run_id)}|submitted=$submitted|completed=$completed|failed=$failed|not_ready=$notReady|mode=$c1BackendPressureMode")
-                              complete(
-                                OK,
-                                c1BackendPressureResponse(
-                                  request.run_id,
-                                  request.request_generation_mode,
-                                  submitted,
-                                  completed,
-                                  failed,
-                                  notReady,
-                                  results))
-                            case Failure(t) =>
-                              logging.info(
-                                this,
-                                s"C1_BACKEND_PRESSURE_STATUS|run_id=${c1BackendPressureValue(request.run_id)}|submitted=$submitted|completed=0|failed=$submitted|not_ready=0|mode=$c1BackendPressureMode")
-                              terminate(InternalServerError, t.getMessage)
+                          if (request.request_generation_mode == c1BackendPressureRequestModeRamp) {
+                            val run = runC1BackendPressureOpenLoopRamp(user, action, request)
+                            run.onComplete {
+                              case Success(results) =>
+                                val completed = results.count {
+                                  case C1BackendPressureOutcome(_, Right(result)) => result.completed
+                                  case _                                          => false
+                                }
+                                val failed = results.count {
+                                  case C1BackendPressureOutcome(_, Right(result)) => result.failed
+                                  case C1BackendPressureOutcome(_, Left(_))       => true
+                                }
+                                val notReady = results.count {
+                                  case C1BackendPressureOutcome(_, Right(result)) => result.notReady
+                                  case _                                          => false
+                                }
+                                emitC1BackendPressureStatus(request.run_id, submitted, completed, failed, notReady)
+                              case Failure(_) =>
+                                emitC1BackendPressureStatus(request.run_id, submitted, 0, submitted, 0)
+                            }
+                            complete(Accepted, c1BackendPressureAckResponse(request, submitted))
+                          } else {
+                            val run = runC1BackendPressureOpenLoopRate(user, action, request)
+                            onComplete(run) {
+                              case Success(results) =>
+                                val completed = results.count {
+                                  case C1BackendPressureOutcome(_, Right(result)) => result.completed
+                                  case _                                          => false
+                                }
+                                val failed = results.count {
+                                  case C1BackendPressureOutcome(_, Right(result)) => result.failed
+                                  case C1BackendPressureOutcome(_, Left(_))       => true
+                                }
+                                val notReady = results.count {
+                                  case C1BackendPressureOutcome(_, Right(result)) => result.notReady
+                                  case _                                          => false
+                                }
+                                emitC1BackendPressureStatus(request.run_id, submitted, completed, failed, notReady)
+                                complete(
+                                  OK,
+                                  c1BackendPressureResponse(
+                                    request.run_id,
+                                    request.request_generation_mode,
+                                    submitted,
+                                    completed,
+                                    failed,
+                                    notReady,
+                                    results))
+                              case Failure(t) =>
+                                emitC1BackendPressureStatus(request.run_id, submitted, 0, submitted, 0)
+                                terminate(InternalServerError, t.getMessage)
+                            }
                           }
 
                         case Failure(f) =>
