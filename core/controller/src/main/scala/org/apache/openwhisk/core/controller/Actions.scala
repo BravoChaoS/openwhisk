@@ -131,7 +131,6 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                               target_arrival_rate_per_sec: Option[Double],
                                               duration_sec: Option[Int],
                                               planned_logical_requests: Int,
-                                              max_inflight_safety_limit: Int,
                                               ramp_rate_schedule_per_sec: Option[Vector[Double]] = None,
                                               ramp_stage_duration_sec: Option[Int] = None,
                                               stage_gate_policy_id: Option[String] = None,
@@ -166,7 +165,6 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         target_arrival_rate_per_sec = optional[Double](fields, "target_arrival_rate_per_sec"),
         duration_sec = optional[Int](fields, "duration_sec"),
         planned_logical_requests = required[Int](fields, "planned_logical_requests"),
-        max_inflight_safety_limit = required[Int](fields, "max_inflight_safety_limit"),
         ramp_rate_schedule_per_sec = optional[Vector[Double]](fields, "ramp_rate_schedule_per_sec"),
         ramp_stage_duration_sec = optional[Int](fields, "ramp_stage_duration_sec"),
         stage_gate_policy_id = optional[String](fields, "stage_gate_policy_id"),
@@ -187,8 +185,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         "payload_bytes" -> JsNumber(request.payload_bytes),
         "workload_id" -> JsString(request.workload_id),
         "request_generation_mode" -> JsString(request.request_generation_mode),
-        "planned_logical_requests" -> JsNumber(request.planned_logical_requests),
-        "max_inflight_safety_limit" -> JsNumber(request.max_inflight_safety_limit))
+        "planned_logical_requests" -> JsNumber(request.planned_logical_requests))
       val optionalFields: Map[String, JsValue] = Seq(
         request.target_arrival_rate_per_sec.map("target_arrival_rate_per_sec" -> JsNumber(_)),
         request.duration_sec.map("duration_sec" -> JsNumber(_)),
@@ -208,7 +205,6 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
   private val c1BackendPressureRequestModeStageGatedRamp = "open_loop_stage_gated_ramp"
   private val c1BackendPressureStageGatePolicySourceLagV1 = "source_lag_v1"
   private val c1BackendPressureControllerSourceEnv = "C1_BACKEND_PRESSURE_CONTROLLER_SOURCE"
-  private val c1BackendPressureMaxLogicalRequests = 100000
   private val c1BackendPressureMaxPayloadBytes = 1048576
 
   private case class C1BackendPressureOutcome(logicalRequestId: String,
@@ -306,13 +302,6 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       errorIf(request.concurrency <= 0, "concurrency must be positive"),
       errorIf(request.logical_requests <= 0, "logical_requests must be positive"),
       errorIf(request.planned_logical_requests <= 0, "planned_logical_requests must be positive"),
-      errorIf(request.max_inflight_safety_limit <= 0, "max_inflight_safety_limit must be positive"),
-      errorIf(
-        request.planned_logical_requests > request.max_inflight_safety_limit,
-        "planned_logical_requests must not exceed max_inflight_safety_limit"),
-      errorIf(
-        request.logical_requests > c1BackendPressureMaxLogicalRequests,
-        s"logical_requests must be <= $c1BackendPressureMaxLogicalRequests"),
       errorIf(request.payload_bytes < 0, "payload_bytes must be non-negative"),
       errorIf(
         request.payload_bytes > c1BackendPressureMaxPayloadBytes,
@@ -340,7 +329,6 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       "target_arrival_rate_per_sec" -> JsNumber(scheduleEntry.rampStageRatePerSec.orElse(request.target_arrival_rate_per_sec).getOrElse(0.0)),
       "duration_sec" -> JsNumber(request.duration_sec.orElse(request.ramp_stage_duration_sec).getOrElse(0)),
       "planned_logical_requests" -> JsNumber(request.planned_logical_requests),
-      "max_inflight_safety_limit" -> JsNumber(request.max_inflight_safety_limit),
       "failure_probability" -> JsNumber(request.failure_probability),
       "payload_bytes" -> JsNumber(request.payload_bytes),
       "workload_id" -> JsString(request.workload_id),
