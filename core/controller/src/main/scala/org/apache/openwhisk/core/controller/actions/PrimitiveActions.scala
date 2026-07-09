@@ -116,6 +116,14 @@ protected[actions] trait PrimitiveActions {
       activation.duration.contains(0L) &&
       c1BackendPressureActivationKind(activation).contains("unknown")
 
+  private def isC1BackendPressureScheduledActionFailure(activation: WhiskActivation): Boolean =
+    activation.response.result.exists {
+      case JsObject(fields) =>
+        fields.get("scheduled_failure").contains(JsBoolean(true)) ||
+          fields.get("failure_type").contains(JsString("scheduled_failure"))
+      case _ => false
+    }
+
   private def emitC1BackendPressureSchedulerFallbackRetry(metadata: BackendPressureMetadata,
                                                           activation: WhiskActivation,
                                                           remainingRetries: Int)(
@@ -253,6 +261,8 @@ protected[actions] trait PrimitiveActions {
               val (status, reason) =
                 if (isC1BackendPressureSchedulerFallback(activation) && schedulerFallbackRetryLimit > 0) {
                   (BackendPressureActivationResult.Failed, "scheduler_internal_fallback_exhausted")
+                } else if (isC1BackendPressureScheduledActionFailure(activation)) {
+                  (BackendPressureActivationResult.Failed, "action_level_scheduled_failure")
                 } else if (activation.response.isWhiskError) {
                   (BackendPressureActivationResult.Failed, "blocking_activation_result_failed")
                 } else {

@@ -295,7 +295,10 @@ class FunctionPullingContainerProxy(
               c1TimingField("compress_mode", c1BackendPressureResultField(fields, "workload_compress_mode").getOrElse("")),
               c1TimingField("compress_bytes", c1BackendPressureResultField(fields, "workload_compress_bytes").getOrElse("")),
               c1TimingField("compress_level", c1BackendPressureResultField(fields, "workload_compress_level").getOrElse("")),
-              c1TimingField("output_bytes", c1BackendPressureResultField(fields, "workload_output_bytes").getOrElse("")))
+              c1TimingField("output_bytes", c1BackendPressureResultField(fields, "workload_output_bytes").getOrElse("")),
+              c1TimingField("failure_probability", c1BackendPressureResultField(fields, "failure_probability").getOrElse("")),
+              c1TimingField("scheduled_failure", c1BackendPressureResultField(fields, "scheduled_failure").getOrElse("")),
+              c1TimingField("failure_reason", c1BackendPressureResultField(fields, "failure_reason").getOrElse("")))
             logging.info(this, s"C1_BACKEND_PRESSURE_WORKLOAD_TIMING|${markerFields.mkString("|")}")(msg.transid)
           }
         case _ =>
