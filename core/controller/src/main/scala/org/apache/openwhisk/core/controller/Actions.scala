@@ -138,7 +138,13 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                               stage_gate_source_schedule_lag_p95_ms: Option[Double] = None,
                                               stage_gate_source_schedule_lag_max_ms: Option[Double] = None,
                                               completion_window_size: Option[Int] = None,
-                                              completion_window_timeout_sec: Option[Int] = None)
+                                              completion_window_timeout_sec: Option[Int] = None,
+                                              plateau_policy_enabled: Option[Boolean] = None,
+                                              plateau_window_size: Option[Int] = None,
+                                              plateau_warmup_completions: Option[Int] = None,
+                                              plateau_warmup_sec: Option[Int] = None,
+                                              plateau_no_improve_sec: Option[Int] = None,
+                                              plateau_min_improvement_fraction: Option[Double] = None)
 
   private implicit object C1BackendPressureRequestFormat extends RootJsonFormat[C1BackendPressureRequest] {
     private def required[T](fields: Map[String, JsValue], name: String)(implicit reader: JsonReader[T]): T =
@@ -174,7 +180,13 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         stage_gate_source_schedule_lag_p95_ms = optional[Double](fields, "stage_gate_source_schedule_lag_p95_ms"),
         stage_gate_source_schedule_lag_max_ms = optional[Double](fields, "stage_gate_source_schedule_lag_max_ms"),
         completion_window_size = optional[Int](fields, "completion_window_size"),
-        completion_window_timeout_sec = optional[Int](fields, "completion_window_timeout_sec"))
+        completion_window_timeout_sec = optional[Int](fields, "completion_window_timeout_sec"),
+        plateau_policy_enabled = optional[Boolean](fields, "plateau_policy_enabled"),
+        plateau_window_size = optional[Int](fields, "plateau_window_size"),
+        plateau_warmup_completions = optional[Int](fields, "plateau_warmup_completions"),
+        plateau_warmup_sec = optional[Int](fields, "plateau_warmup_sec"),
+        plateau_no_improve_sec = optional[Int](fields, "plateau_no_improve_sec"),
+        plateau_min_improvement_fraction = optional[Double](fields, "plateau_min_improvement_fraction"))
     }
 
     override def write(request: C1BackendPressureRequest): JsValue = {
@@ -200,7 +212,13 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         request.stage_gate_source_schedule_lag_p95_ms.map("stage_gate_source_schedule_lag_p95_ms" -> JsNumber(_)),
         request.stage_gate_source_schedule_lag_max_ms.map("stage_gate_source_schedule_lag_max_ms" -> JsNumber(_)),
         request.completion_window_size.map("completion_window_size" -> JsNumber(_)),
-        request.completion_window_timeout_sec.map("completion_window_timeout_sec" -> JsNumber(_))).flatten.toMap
+        request.completion_window_timeout_sec.map("completion_window_timeout_sec" -> JsNumber(_)),
+        request.plateau_policy_enabled.map("plateau_policy_enabled" -> JsBoolean(_)),
+        request.plateau_window_size.map("plateau_window_size" -> JsNumber(_)),
+        request.plateau_warmup_completions.map("plateau_warmup_completions" -> JsNumber(_)),
+        request.plateau_warmup_sec.map("plateau_warmup_sec" -> JsNumber(_)),
+        request.plateau_no_improve_sec.map("plateau_no_improve_sec" -> JsNumber(_)),
+        request.plateau_min_improvement_fraction.map("plateau_min_improvement_fraction" -> JsNumber(_))).flatten.toMap
       JsObject(baseFields ++ optionalFields)
     }
   }
@@ -217,6 +235,13 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
   private case class C1BackendPressureOutcome(logicalRequestId: String,
                                               result: Either[String, BackendPressureActivationResult],
                                               sourceScheduleLagNs: Long)
+
+  private case class C1BackendPressurePlateauState(bestRollingQps: Double = 0.0,
+                                                   bestCompletionElapsedNs: Long = 0L,
+                                                   currentRollingQps: Double = 0.0,
+                                                   rollingWindowSize: Int = 0,
+                                                   stop: Boolean = false,
+                                                   stopReason: String = "")
 
   private case class C1BackendPressureScheduleEntry(logicalRequestId: Int,
                                                     plannedSubmitOffsetNs: Long,
@@ -263,7 +288,15 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
           errorIf(request.completion_window_size.nonEmpty, "completion_window_size is only valid for completion_window"),
           errorIf(
             request.completion_window_timeout_sec.nonEmpty,
-            "completion_window_timeout_sec is only valid for completion_window"))
+            "completion_window_timeout_sec is only valid for completion_window"),
+          errorIf(request.plateau_policy_enabled.nonEmpty, "plateau_policy_enabled is only valid for completion_window"),
+          errorIf(request.plateau_window_size.nonEmpty, "plateau_window_size is only valid for completion_window"),
+          errorIf(request.plateau_warmup_completions.nonEmpty, "plateau_warmup_completions is only valid for completion_window"),
+          errorIf(request.plateau_warmup_sec.nonEmpty, "plateau_warmup_sec is only valid for completion_window"),
+          errorIf(request.plateau_no_improve_sec.nonEmpty, "plateau_no_improve_sec is only valid for completion_window"),
+          errorIf(
+            request.plateau_min_improvement_fraction.nonEmpty,
+            "plateau_min_improvement_fraction is only valid for completion_window"))
       case `c1BackendPressureRequestModeRamp` | `c1BackendPressureRequestModeStageGatedRamp` =>
         val schedule = request.ramp_rate_schedule_per_sec.getOrElse(Vector.empty)
         val stageDuration = request.ramp_stage_duration_sec.getOrElse(0)
@@ -304,7 +337,15 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
           errorIf(request.completion_window_size.nonEmpty, "completion_window_size is only valid for completion_window"),
           errorIf(
             request.completion_window_timeout_sec.nonEmpty,
-            "completion_window_timeout_sec is only valid for completion_window"))
+            "completion_window_timeout_sec is only valid for completion_window"),
+          errorIf(request.plateau_policy_enabled.nonEmpty, "plateau_policy_enabled is only valid for completion_window"),
+          errorIf(request.plateau_window_size.nonEmpty, "plateau_window_size is only valid for completion_window"),
+          errorIf(request.plateau_warmup_completions.nonEmpty, "plateau_warmup_completions is only valid for completion_window"),
+          errorIf(request.plateau_warmup_sec.nonEmpty, "plateau_warmup_sec is only valid for completion_window"),
+          errorIf(request.plateau_no_improve_sec.nonEmpty, "plateau_no_improve_sec is only valid for completion_window"),
+          errorIf(
+            request.plateau_min_improvement_fraction.nonEmpty,
+            "plateau_min_improvement_fraction is only valid for completion_window"))
       case `c1BackendPressureRequestModeCompletionWindow` =>
         Seq(
           errorIf(
@@ -329,7 +370,14 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             "stage_gate_source_schedule_lag_p95_ms is only valid for open_loop_stage_gated_ramp"),
           errorIf(
             request.stage_gate_source_schedule_lag_max_ms.nonEmpty,
-            "stage_gate_source_schedule_lag_max_ms is only valid for open_loop_stage_gated_ramp"))
+            "stage_gate_source_schedule_lag_max_ms is only valid for open_loop_stage_gated_ramp"),
+          errorIf(request.plateau_window_size.exists(_ <= 0), "plateau_window_size must be positive"),
+          errorIf(request.plateau_warmup_completions.exists(_ < 0), "plateau_warmup_completions must be non-negative"),
+          errorIf(request.plateau_warmup_sec.exists(_ < 0), "plateau_warmup_sec must be non-negative"),
+          errorIf(request.plateau_no_improve_sec.exists(_ <= 0), "plateau_no_improve_sec must be positive"),
+          errorIf(
+            request.plateau_min_improvement_fraction.exists(_ < 0.0),
+            "plateau_min_improvement_fraction must be non-negative"))
       case _ =>
         Seq(Some(s"request_generation_mode must be $c1BackendPressureRequestModeOpenLoop, $c1BackendPressureRequestModeRamp, $c1BackendPressureRequestModeStageGatedRamp, or $c1BackendPressureRequestModeCompletionWindow"))
     }
@@ -492,8 +540,9 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                                finalSubmittedLogicalRequests: Int,
                                                finalStageIndex: Int,
                                                finalDecision: String,
-                                               finalDecisionReason: String): Unit = {
-    val fields = Seq(
+                                               finalDecisionReason: String,
+                                               extraFields: Seq[(String, String)] = Seq.empty): Unit = {
+    val fields = (Seq(
       "run_id" -> request.run_id,
       "request_generation_mode" -> request.request_generation_mode,
       "stage_gate_policy_id" -> request.stage_gate_policy_id.getOrElse(""),
@@ -501,7 +550,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       "final_submitted_logical_requests" -> finalSubmittedLogicalRequests.toString,
       "final_stage_index" -> finalStageIndex.toString,
       "final_decision" -> finalDecision,
-      "final_decision_reason" -> finalDecisionReason).map {
+      "final_decision_reason" -> finalDecisionReason) ++ extraFields).map {
       case (key, value) => s"$key=${c1BackendPressureValue(value)}"
     }
     logging.info(this, s"C1_BACKEND_PRESSURE_RUN_DECISION|${fields.mkString("|")}")
@@ -513,7 +562,11 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                                completedSoFar: Int,
                                                inFlightAfterCompletion: Int,
                                                nextLogicalRequestId: Option[Int],
-                                               outcome: C1BackendPressureOutcome): Unit = {
+                                               outcome: C1BackendPressureOutcome,
+                                               completionElapsedNs: Option[Long] = None,
+                                               rollingQps: Option[Double] = None,
+                                               rollingWindowSize: Option[Int] = None,
+                                               plateauDecision: Option[String] = None): Unit = {
     val (completionStatus, completionReason, activationId) = outcome.result match {
       case Right(result) =>
         (result.status, result.reason, result.activationId.asString)
@@ -533,7 +586,11 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       "inflight_after_completion" -> inFlightAfterCompletion.toString,
       "next_logical_request_id" -> nextLogicalRequestId.map(_.toString).getOrElse(""),
       "completion_status" -> completionStatus,
-      "completion_reason" -> completionReason).map {
+      "completion_reason" -> completionReason,
+      "completion_elapsed_ns" -> completionElapsedNs.map(_.toString).getOrElse(""),
+      "rolling_completion_qps" -> rollingQps.map(_.toString).getOrElse(""),
+      "rolling_window_size" -> rollingWindowSize.map(_.toString).getOrElse(""),
+      "plateau_decision" -> plateauDecision.getOrElse("")).map {
       case (key, value) => s"$key=${c1BackendPressureValue(value)}"
     }
     logging.info(this, s"C1_BACKEND_PRESSURE_WINDOW_EVENT|${fields.mkString("|")}")
@@ -831,6 +888,57 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
     val runStartMonoNs = System.nanoTime()
     val targetLogicalRequests = request.planned_logical_requests
     val windowSize = math.min(request.completion_window_size.getOrElse(1), targetLogicalRequests)
+    val plateauEnabled = request.plateau_policy_enabled.getOrElse(false)
+    val plateauWindowSize = math.min(request.plateau_window_size.getOrElse(windowSize), targetLogicalRequests)
+    val plateauWarmupCompletions = request.plateau_warmup_completions.getOrElse(1000)
+    val plateauWarmupNs = request.plateau_warmup_sec.getOrElse(10).toLong * 1000000000L
+    val plateauNoImproveNs = request.plateau_no_improve_sec.getOrElse(10).toLong * 1000000000L
+    val plateauMinImprovementFraction = request.plateau_min_improvement_fraction.getOrElse(0.03)
+
+    def plateauRunDecisionFields(state: C1BackendPressurePlateauState,
+                                 completionCount: Int,
+                                 elapsedNs: Long): Seq[(String, String)] =
+      Seq(
+        "plateau_policy_enabled" -> plateauEnabled.toString,
+        "plateau_window_size" -> plateauWindowSize.toString,
+        "plateau_warmup_completions" -> plateauWarmupCompletions.toString,
+        "plateau_warmup_sec" -> request.plateau_warmup_sec.getOrElse(10).toString,
+        "plateau_no_improve_sec" -> request.plateau_no_improve_sec.getOrElse(10).toString,
+        "plateau_min_improvement_fraction" -> plateauMinImprovementFraction.toString,
+        "plateau_completion_count" -> completionCount.toString,
+        "plateau_elapsed_ns" -> elapsedNs.toString,
+        "plateau_best_rolling_qps" -> state.bestRollingQps.toString,
+        "plateau_current_rolling_qps" -> state.currentRollingQps.toString,
+        "plateau_best_completion_elapsed_ns" -> state.bestCompletionElapsedNs.toString)
+
+    def updatePlateauState(previous: C1BackendPressurePlateauState,
+                           completionTimesNs: Vector[Long],
+                           completionElapsedNs: Long): C1BackendPressurePlateauState = {
+      if (!plateauEnabled || plateauWindowSize <= 0 || completionTimesNs.size < plateauWindowSize) {
+        previous.copy(rollingWindowSize = plateauWindowSize)
+      } else {
+        val windowStartNs = completionTimesNs(completionTimesNs.size - plateauWindowSize)
+        val windowElapsedNs = math.max(1L, completionElapsedNs - windowStartNs)
+        val rollingQps = plateauWindowSize.toDouble * 1000000000.0 / windowElapsedNs.toDouble
+        val improvementThreshold = previous.bestRollingQps * (1.0 + plateauMinImprovementFraction)
+        val warmupDone = completionTimesNs.size + 1 >= plateauWarmupCompletions && completionElapsedNs >= plateauWarmupNs
+        if (previous.bestRollingQps <= 0.0 || rollingQps > improvementThreshold) {
+          C1BackendPressurePlateauState(
+            bestRollingQps = rollingQps,
+            bestCompletionElapsedNs = completionElapsedNs,
+            currentRollingQps = rollingQps,
+            rollingWindowSize = plateauWindowSize)
+        } else if (warmupDone && completionElapsedNs - previous.bestCompletionElapsedNs > plateauNoImproveNs) {
+          previous.copy(
+            currentRollingQps = rollingQps,
+            rollingWindowSize = plateauWindowSize,
+            stop = true,
+            stopReason = "plateau_no_improvement")
+        } else {
+          previous.copy(currentRollingQps = rollingQps, rollingWindowSize = plateauWindowSize)
+        }
+      }
+    }
 
     def launch(logicalRequestId: Int): (Int, Future[C1BackendPressureOutcome]) = {
       val actualSubmitMonoNs = System.nanoTime()
@@ -851,12 +959,36 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
 
     def loop(nextLogicalRequestId: Int,
              inFlight: Vector[(Int, Future[C1BackendPressureOutcome])],
-             accumulated: Vector[C1BackendPressureOutcome]): Future[Vector[C1BackendPressureOutcome]] = {
+             accumulated: Vector[C1BackendPressureOutcome],
+             completionTimesNs: Vector[Long],
+             plateauState: C1BackendPressurePlateauState,
+             stopDecision: Option[(String, String, C1BackendPressurePlateauState, Int, Long)]): Future[Vector[C1BackendPressureOutcome]] = {
       if (inFlight.isEmpty) {
-        emitC1BackendPressureRunDecision(request, accumulated.size, 0, "complete", "completion_window_target_complete")
+        stopDecision match {
+          case Some((decision, reason, finalPlateauState, finalCompletionCount, finalElapsedNs)) =>
+            emitC1BackendPressureRunDecision(
+              request,
+              accumulated.size,
+              0,
+              decision,
+              reason,
+              plateauRunDecisionFields(finalPlateauState, finalCompletionCount, finalElapsedNs))
+          case None =>
+            val reason =
+              if (plateauEnabled && accumulated.size < targetLogicalRequests) "completion_window_plateau_stop"
+              else "completion_window_target_complete"
+            emitC1BackendPressureRunDecision(
+              request,
+              accumulated.size,
+              0,
+              "complete",
+              reason,
+              plateauRunDecisionFields(plateauState, accumulated.size, completionTimesNs.lastOption.getOrElse(0L)))
+        }
         Future.successful(accumulated)
       } else {
         Future.firstCompletedOf(inFlight.map(_._2)).flatMap { outcome =>
+          val completionElapsedNs = math.max(0L, System.nanoTime() - runStartMonoNs)
           val remaining = inFlight.filterNot { case (logicalRequestId, _) =>
             logicalRequestId.toString == outcome.logicalRequestId
           }
@@ -865,12 +997,24 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             case Right(result) => result.completed || result.failed
             case Left(_)       => false
           }
+          val newPlateauState =
+            if (terminalResult) updatePlateauState(plateauState, completionTimesNs, completionElapsedNs) else plateauState
+          val plateauStop = terminalResult && newPlateauState.stop
+          val targetReached = nextLogicalRequestId > targetLogicalRequests
           val (newNextLogicalRequestId, nextInFlight, refillLogicalRequestId) =
-            if (terminalResult && nextLogicalRequestId <= targetLogicalRequests) {
+            if (terminalResult && !plateauStop && nextLogicalRequestId <= targetLogicalRequests) {
               val refill = launch(nextLogicalRequestId)
               (nextLogicalRequestId + 1, remaining :+ refill, Some(nextLogicalRequestId))
             } else {
               (nextLogicalRequestId, if (terminalResult) remaining else Vector.empty, None)
+            }
+          val newStopDecision =
+            if (plateauStop) {
+              Some(("complete", "completion_window_plateau_stop", newPlateauState, completedSoFar, completionElapsedNs))
+            } else if (terminalResult && targetReached && nextInFlight.isEmpty) {
+              Some(("complete", "completion_window_target_complete", newPlateauState, completedSoFar, completionElapsedNs))
+            } else {
+              stopDecision
             }
           emitC1BackendPressureWindowEvent(
             request,
@@ -879,9 +1023,19 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             completedSoFar = completedSoFar,
             inFlightAfterCompletion = nextInFlight.size,
             nextLogicalRequestId = refillLogicalRequestId,
-            outcome = outcome)
+            outcome = outcome,
+            completionElapsedNs = if (terminalResult) Some(completionElapsedNs) else None,
+            rollingQps = if (newPlateauState.currentRollingQps > 0.0) Some(newPlateauState.currentRollingQps) else None,
+            rollingWindowSize = if (newPlateauState.rollingWindowSize > 0) Some(newPlateauState.rollingWindowSize) else None,
+            plateauDecision = if (plateauStop) Some("stop") else if (plateauEnabled) Some("continue") else None)
           if (terminalResult) {
-            loop(newNextLogicalRequestId, nextInFlight, accumulated :+ outcome)
+            loop(
+              newNextLogicalRequestId,
+              nextInFlight,
+              accumulated :+ outcome,
+              completionTimesNs :+ completionElapsedNs,
+              newPlateauState.copy(stop = false, stopReason = ""),
+              newStopDecision)
           } else {
             val reason = outcome.result match {
               case Right(result) => result.reason
@@ -892,7 +1046,8 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
               newNextLogicalRequestId - 1,
               0,
               "invalid_non_terminal_completion_signal",
-              reason)
+              reason,
+              plateauRunDecisionFields(newPlateauState, completedSoFar, completionElapsedNs))
             Future.successful(accumulated :+ outcome)
           }
         }
@@ -900,7 +1055,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
     }
 
     val initial = (1 to windowSize).toVector.map(launch)
-    loop(windowSize + 1, initial, Vector.empty)
+    loop(windowSize + 1, initial, Vector.empty, Vector.empty, C1BackendPressurePlateauState(rollingWindowSize = plateauWindowSize), None)
   }
 
   def backendPressureRoutes(user: Identity)(implicit transid: TransactionId) = {
