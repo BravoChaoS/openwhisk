@@ -136,7 +136,9 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                               stage_gate_policy_id: Option[String] = None,
                                               stage_gate_source_submit_failure_limit: Option[Int] = None,
                                               stage_gate_source_schedule_lag_p95_ms: Option[Double] = None,
-                                              stage_gate_source_schedule_lag_max_ms: Option[Double] = None)
+                                              stage_gate_source_schedule_lag_max_ms: Option[Double] = None,
+                                              completion_window_size: Option[Int] = None,
+                                              completion_window_timeout_sec: Option[Int] = None)
 
   private implicit object C1BackendPressureRequestFormat extends RootJsonFormat[C1BackendPressureRequest] {
     private def required[T](fields: Map[String, JsValue], name: String)(implicit reader: JsonReader[T]): T =
@@ -170,7 +172,9 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         stage_gate_policy_id = optional[String](fields, "stage_gate_policy_id"),
         stage_gate_source_submit_failure_limit = optional[Int](fields, "stage_gate_source_submit_failure_limit"),
         stage_gate_source_schedule_lag_p95_ms = optional[Double](fields, "stage_gate_source_schedule_lag_p95_ms"),
-        stage_gate_source_schedule_lag_max_ms = optional[Double](fields, "stage_gate_source_schedule_lag_max_ms"))
+        stage_gate_source_schedule_lag_max_ms = optional[Double](fields, "stage_gate_source_schedule_lag_max_ms"),
+        completion_window_size = optional[Int](fields, "completion_window_size"),
+        completion_window_timeout_sec = optional[Int](fields, "completion_window_timeout_sec"))
     }
 
     override def write(request: C1BackendPressureRequest): JsValue = {
@@ -194,7 +198,9 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         request.stage_gate_policy_id.map("stage_gate_policy_id" -> JsString(_)),
         request.stage_gate_source_submit_failure_limit.map("stage_gate_source_submit_failure_limit" -> JsNumber(_)),
         request.stage_gate_source_schedule_lag_p95_ms.map("stage_gate_source_schedule_lag_p95_ms" -> JsNumber(_)),
-        request.stage_gate_source_schedule_lag_max_ms.map("stage_gate_source_schedule_lag_max_ms" -> JsNumber(_))).flatten.toMap
+        request.stage_gate_source_schedule_lag_max_ms.map("stage_gate_source_schedule_lag_max_ms" -> JsNumber(_)),
+        request.completion_window_size.map("completion_window_size" -> JsNumber(_)),
+        request.completion_window_timeout_sec.map("completion_window_timeout_sec" -> JsNumber(_))).flatten.toMap
       JsObject(baseFields ++ optionalFields)
     }
   }
@@ -203,6 +209,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
   private val c1BackendPressureRequestModeOpenLoop = "open_loop_rate"
   private val c1BackendPressureRequestModeRamp = "open_loop_ramp"
   private val c1BackendPressureRequestModeStageGatedRamp = "open_loop_stage_gated_ramp"
+  private val c1BackendPressureRequestModeCompletionWindow = "completion_window"
   private val c1BackendPressureStageGatePolicySourceLagV1 = "source_lag_v1"
   private val c1BackendPressureControllerSourceEnv = "C1_BACKEND_PRESSURE_CONTROLLER_SOURCE"
   private val c1BackendPressureMaxPayloadBytes = 1048576
@@ -252,7 +259,11 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             "stage_gate_source_schedule_lag_p95_ms is only valid for open_loop_stage_gated_ramp"),
           errorIf(
             request.stage_gate_source_schedule_lag_max_ms.nonEmpty,
-            "stage_gate_source_schedule_lag_max_ms is only valid for open_loop_stage_gated_ramp"))
+            "stage_gate_source_schedule_lag_max_ms is only valid for open_loop_stage_gated_ramp"),
+          errorIf(request.completion_window_size.nonEmpty, "completion_window_size is only valid for completion_window"),
+          errorIf(
+            request.completion_window_timeout_sec.nonEmpty,
+            "completion_window_timeout_sec is only valid for completion_window"))
       case `c1BackendPressureRequestModeRamp` | `c1BackendPressureRequestModeStageGatedRamp` =>
         val schedule = request.ramp_rate_schedule_per_sec.getOrElse(Vector.empty)
         val stageDuration = request.ramp_stage_duration_sec.getOrElse(0)
@@ -289,9 +300,38 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             "stage_gate_source_schedule_lag_p95_ms is only valid for open_loop_stage_gated_ramp"),
           errorIf(
             !isStageGated && request.stage_gate_source_schedule_lag_max_ms.nonEmpty,
+            "stage_gate_source_schedule_lag_max_ms is only valid for open_loop_stage_gated_ramp"),
+          errorIf(request.completion_window_size.nonEmpty, "completion_window_size is only valid for completion_window"),
+          errorIf(
+            request.completion_window_timeout_sec.nonEmpty,
+            "completion_window_timeout_sec is only valid for completion_window"))
+      case `c1BackendPressureRequestModeCompletionWindow` =>
+        Seq(
+          errorIf(
+            request.logical_requests != request.planned_logical_requests,
+            s"logical_requests must equal planned_logical_requests for $c1BackendPressureRequestModeCompletionWindow"),
+          errorIf(
+            request.completion_window_size.forall(_ <= 0),
+            "completion_window_size must be positive for completion_window"),
+          errorIf(
+            request.completion_window_timeout_sec.forall(_ <= 0),
+            "completion_window_timeout_sec must be positive for completion_window"),
+          errorIf(request.target_arrival_rate_per_sec.nonEmpty, "target_arrival_rate_per_sec is not valid for completion_window"),
+          errorIf(request.duration_sec.nonEmpty, "duration_sec is not valid for completion_window"),
+          errorIf(request.ramp_rate_schedule_per_sec.exists(_.nonEmpty), "ramp_rate_schedule_per_sec is not valid for completion_window"),
+          errorIf(request.ramp_stage_duration_sec.nonEmpty, "ramp_stage_duration_sec is not valid for completion_window"),
+          errorIf(request.stage_gate_policy_id.nonEmpty, "stage_gate_policy_id is only valid for open_loop_stage_gated_ramp"),
+          errorIf(
+            request.stage_gate_source_submit_failure_limit.nonEmpty,
+            "stage_gate_source_submit_failure_limit is only valid for open_loop_stage_gated_ramp"),
+          errorIf(
+            request.stage_gate_source_schedule_lag_p95_ms.nonEmpty,
+            "stage_gate_source_schedule_lag_p95_ms is only valid for open_loop_stage_gated_ramp"),
+          errorIf(
+            request.stage_gate_source_schedule_lag_max_ms.nonEmpty,
             "stage_gate_source_schedule_lag_max_ms is only valid for open_loop_stage_gated_ramp"))
       case _ =>
-        Seq(Some(s"request_generation_mode must be $c1BackendPressureRequestModeOpenLoop, $c1BackendPressureRequestModeRamp, or $c1BackendPressureRequestModeStageGatedRamp"))
+        Seq(Some(s"request_generation_mode must be $c1BackendPressureRequestModeOpenLoop, $c1BackendPressureRequestModeRamp, $c1BackendPressureRequestModeStageGatedRamp, or $c1BackendPressureRequestModeCompletionWindow"))
     }
 
     val errors = Seq(
@@ -467,6 +507,38 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
     logging.info(this, s"C1_BACKEND_PRESSURE_RUN_DECISION|${fields.mkString("|")}")
   }
 
+  private def emitC1BackendPressureWindowEvent(request: C1BackendPressureRequest,
+                                               logicalRequestId: String,
+                                               submittedSoFar: Int,
+                                               completedSoFar: Int,
+                                               inFlightAfterCompletion: Int,
+                                               nextLogicalRequestId: Option[Int],
+                                               outcome: C1BackendPressureOutcome): Unit = {
+    val (completionStatus, completionReason, activationId) = outcome.result match {
+      case Right(result) =>
+        (result.status, result.reason, result.activationId.asString)
+      case Left(reason) =>
+        (BackendPressureActivationResult.Failed, reason, "")
+    }
+    val fields = Seq(
+      "run_id" -> request.run_id,
+      "request_generation_mode" -> request.request_generation_mode,
+      "completion_window_size" -> request.completion_window_size.getOrElse(0).toString,
+      "completion_signal" -> "blocking_activation_result",
+      "terminal_audit" -> "blocking_activation_result_plus_N800_or_OW800_postrun",
+      "logical_request_id" -> logicalRequestId,
+      "activation_id" -> activationId,
+      "submitted_so_far" -> submittedSoFar.toString,
+      "completed_so_far" -> completedSoFar.toString,
+      "inflight_after_completion" -> inFlightAfterCompletion.toString,
+      "next_logical_request_id" -> nextLogicalRequestId.map(_.toString).getOrElse(""),
+      "completion_status" -> completionStatus,
+      "completion_reason" -> completionReason).map {
+      case (key, value) => s"$key=${c1BackendPressureValue(value)}"
+    }
+    logging.info(this, s"C1_BACKEND_PRESSURE_WINDOW_EVENT|${fields.mkString("|")}")
+  }
+
   private def c1BackendPressureStatusDetail(runId: String,
                                             logicalRequestId: String,
                                             status: String,
@@ -491,7 +563,8 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                       scheduleEntry: C1BackendPressureScheduleEntry,
                                       plannedSubmitMonoNs: Long,
                                       actualSubmitMonoNs: Long,
-                                      sourceScheduleLagNs: Long)(
+                                      sourceScheduleLagNs: Long,
+                                      requireTerminalActivationResult: Boolean = false)(
     implicit parentTransid: TransactionId): Future[C1BackendPressureOutcome] = {
     val logicalRequestIdString = scheduleEntry.logicalRequestId.toString
     val logicalTransid = TransactionId.childOf(parentTransid)
@@ -513,8 +586,16 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       actualSubmitMonoNs = actualSubmitMonoNs,
       sourceScheduleLagNs = sourceScheduleLagNs)
 
-    invokeBackendPressureAction(user, action, Some(c1BackendPressurePayload(request, scheduleEntry)), metadata)(
-      logicalTransid)
+    val invocation =
+      if (requireTerminalActivationResult) {
+        invokeBackendPressureBlockingAction(user, action, Some(c1BackendPressurePayload(request, scheduleEntry)), metadata)(
+          logicalTransid)
+      } else {
+        invokeBackendPressureAction(user, action, Some(c1BackendPressurePayload(request, scheduleEntry)), metadata)(
+          logicalTransid)
+      }
+
+    invocation
       .map { result =>
         if (!result.completed) {
           c1BackendPressureStatusDetail(
@@ -743,6 +824,85 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
     loop(stages, Vector.empty)
   }
 
+  private def runC1BackendPressureCompletionWindow(user: Identity,
+                                                   action: WhiskActionMetaData,
+                                                   request: C1BackendPressureRequest)(
+    implicit transid: TransactionId): Future[Vector[C1BackendPressureOutcome]] = {
+    val runStartMonoNs = System.nanoTime()
+    val targetLogicalRequests = request.planned_logical_requests
+    val windowSize = math.min(request.completion_window_size.getOrElse(1), targetLogicalRequests)
+
+    def launch(logicalRequestId: Int): (Int, Future[C1BackendPressureOutcome]) = {
+      val actualSubmitMonoNs = System.nanoTime()
+      val plannedSubmitOffsetNs = math.max(0L, actualSubmitMonoNs - runStartMonoNs)
+      val scheduleEntry = C1BackendPressureScheduleEntry(
+        logicalRequestId = logicalRequestId,
+        plannedSubmitOffsetNs = plannedSubmitOffsetNs)
+      logicalRequestId -> c1BackendPressureInvoke(
+        user,
+        action,
+        request,
+        scheduleEntry,
+        actualSubmitMonoNs,
+        actualSubmitMonoNs,
+        0L,
+        requireTerminalActivationResult = true)
+    }
+
+    def loop(nextLogicalRequestId: Int,
+             inFlight: Vector[(Int, Future[C1BackendPressureOutcome])],
+             accumulated: Vector[C1BackendPressureOutcome]): Future[Vector[C1BackendPressureOutcome]] = {
+      if (inFlight.isEmpty) {
+        emitC1BackendPressureRunDecision(request, accumulated.size, 0, "complete", "completion_window_target_complete")
+        Future.successful(accumulated)
+      } else {
+        Future.firstCompletedOf(inFlight.map(_._2)).flatMap { outcome =>
+          val remaining = inFlight.filterNot { case (logicalRequestId, _) =>
+            logicalRequestId.toString == outcome.logicalRequestId
+          }
+          val completedSoFar = accumulated.size + 1
+          val terminalCompletion = outcome.result match {
+            case Right(result) => result.completed
+            case Left(_)       => false
+          }
+          val (newNextLogicalRequestId, nextInFlight, refillLogicalRequestId) =
+            if (terminalCompletion && nextLogicalRequestId <= targetLogicalRequests) {
+              val refill = launch(nextLogicalRequestId)
+              (nextLogicalRequestId + 1, remaining :+ refill, Some(nextLogicalRequestId))
+            } else {
+              (nextLogicalRequestId, if (terminalCompletion) remaining else Vector.empty, None)
+            }
+          emitC1BackendPressureWindowEvent(
+            request,
+            outcome.logicalRequestId,
+            submittedSoFar = newNextLogicalRequestId - 1,
+            completedSoFar = completedSoFar,
+            inFlightAfterCompletion = nextInFlight.size,
+            nextLogicalRequestId = refillLogicalRequestId,
+            outcome = outcome)
+          if (terminalCompletion) {
+            loop(newNextLogicalRequestId, nextInFlight, accumulated :+ outcome)
+          } else {
+            val reason = outcome.result match {
+              case Right(result) => result.reason
+              case Left(error)   => error
+            }
+            emitC1BackendPressureRunDecision(
+              request,
+              newNextLogicalRequestId - 1,
+              0,
+              "invalid_non_terminal_completion_signal",
+              reason)
+            Future.successful(accumulated :+ outcome)
+          }
+        }
+      }
+    }
+
+    val initial = (1 to windowSize).toVector.map(launch)
+    loop(windowSize + 1, initial, Vector.empty)
+  }
+
   def backendPressureRoutes(user: Identity)(implicit transid: TransactionId) = {
     (path("c1" / "backend-pressure") & post) {
       if (!c1BackendPressureControllerSourceEnabled) {
@@ -778,10 +938,13 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                           val submitted = request.planned_logical_requests
                           if (
                             request.request_generation_mode == c1BackendPressureRequestModeRamp ||
-                            request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp) {
+                            request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp ||
+                            request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
                             val run =
                               if (request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp) {
                                 runC1BackendPressureStageGatedRamp(user, action, request)
+                              } else if (request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
+                                runC1BackendPressureCompletionWindow(user, action, request)
                               } else {
                                 runC1BackendPressureOpenLoopRamp(user, action, request)
                               }
@@ -800,14 +963,18 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                   case _                                          => false
                                 }
                                 val finalSubmitted =
-                                  if (request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp) {
+                                  if (
+                                    request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp ||
+                                    request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
                                     results.size
                                   } else {
                                     submitted
                                   }
                                 emitC1BackendPressureStatus(request.run_id, finalSubmitted, completed, failed, notReady)
                               case Failure(_) =>
-                                if (request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp) {
+                                if (
+                                  request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp ||
+                                  request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
                                   emitC1BackendPressureRunDecision(request, 0, 0, "aborted", "controller_background_failure")
                                 }
                                 emitC1BackendPressureStatus(request.run_id, submitted, 0, submitted, 0)

@@ -200,6 +200,40 @@ protected[actions] trait PrimitiveActions {
     }
   }
 
+  protected[controller] def invokeBackendPressureBlockingAction(
+    user: Identity,
+    action: WhiskActionMetaData,
+    payload: Option[JsValue],
+    metadata: BackendPressureMetadata)(implicit transid: TransactionId): Future[BackendPressureActivationResult] = {
+    action.toExecutableWhiskAction match {
+      case Some(executable) if executable.exec.deprecated =>
+        Future.failed(RejectRequest(BadRequest, runtimeDeprecated(action.exec)))
+      case Some(executable) if executable.annotations.isTruthy(WhiskActivation.conductorAnnotation) =>
+        Future.failed(RejectRequest(BadRequest, "C1 backend-pressure source supports primitive actions only"))
+      case Some(executable) =>
+        invokeSimpleAction(
+          user,
+          executable,
+          payload,
+          Some(executable.limits.timeout.duration + 1.minute),
+          cause = None,
+          backendPressure = Some(metadata)).map {
+          case Right(activation) =>
+            BackendPressureActivationResult(
+              activation.activationId,
+              BackendPressureActivationResult.Completed,
+              "blocking_activation_result_ready")
+          case Left(activationId) =>
+            BackendPressureActivationResult(
+              activationId,
+              BackendPressureActivationResult.NotReady,
+              "blocking_activation_result_not_ready")
+        }
+      case None =>
+        Future.failed(RejectRequest(BadRequest, "C1 backend-pressure source supports primitive actions only"))
+    }
+  }
+
   /**
    * A method that knows how to invoke a single primitive action.
    *
@@ -294,9 +328,10 @@ protected[actions] trait PrimitiveActions {
       case Success(_) => transid.finished(this, startLoadbalancer)
       case Failure(e) => transid.failed(this, startLoadbalancer, e.getMessage)
     } flatMap { activeAckResponse =>
-      backendPressure
-        .map(_ => activeAckResponse)
-        .getOrElse {
+      backendPressure match {
+        case Some(_) if waitForResponse.isEmpty =>
+          activeAckResponse
+        case _ =>
           // is caller waiting for the result of the activation?
           waitForResponse
             .map { timeout =>
