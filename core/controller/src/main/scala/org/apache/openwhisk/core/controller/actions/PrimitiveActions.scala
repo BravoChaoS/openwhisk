@@ -89,6 +89,7 @@ protected[actions] trait PrimitiveActions {
     val fields = Seq(
       c1TimingField("run_id", metadata.runId),
       c1TimingField("logical_request_id", metadata.logicalRequestId),
+      c1TimingField("attempt_id", metadata.attemptId.toString),
       c1TimingField("activation_id", activationId.asString),
       c1TimingField("profile", metadata.profile),
       c1TimingField("concurrency", metadata.concurrency.toString),
@@ -105,6 +106,28 @@ protected[actions] trait PrimitiveActions {
       c1TimingField("actual_submit_mono_ns", metadata.actualSubmitMonoNs.toString),
       c1TimingField("source_schedule_lag_ns", metadata.sourceScheduleLagNs.toString))
     logging.info(this, s"C1_BACKEND_PRESSURE_SUBMIT|${fields.mkString("|")}")(transid)
+  }
+
+  private def c1BackendPressureActivationKind(activation: WhiskActivation): Option[String] =
+    activation.annotations.get(WhiskActivation.kindAnnotation).collect { case JsString(kind) => kind }
+
+  private def isC1BackendPressureSchedulerFallback(activation: WhiskActivation): Boolean =
+    activation.response.isWhiskError &&
+      activation.duration.contains(0L) &&
+      c1BackendPressureActivationKind(activation).contains("unknown")
+
+  private def emitC1BackendPressureSchedulerFallbackRetry(metadata: BackendPressureMetadata,
+                                                          activation: WhiskActivation,
+                                                          remainingRetries: Int)(
+    implicit transid: TransactionId): Unit = {
+    val fields = Seq(
+      c1TimingField("run_id", metadata.runId),
+      c1TimingField("logical_request_id", metadata.logicalRequestId),
+      c1TimingField("attempt_id", metadata.attemptId.toString),
+      c1TimingField("activation_id", activation.activationId.asString),
+      c1TimingField("retry_reason", "scheduler_internal_fallback"),
+      c1TimingField("remaining_retries", remainingRetries.toString))
+    logging.info(this, s"C1_BACKEND_PRESSURE_SCHEDULER_FALLBACK_RETRY|${fields.mkString("|")}")(transid)
   }
 
   private def emitC1TimingEvent(eventCode: String,
@@ -188,12 +211,14 @@ protected[actions] trait PrimitiveActions {
             BackendPressureActivationResult(
               activation.activationId,
               BackendPressureActivationResult.Completed,
-              "active_ack_result_ready")
+              "active_ack_result_ready",
+              metadata.attemptId)
           case Left(activationId) =>
             BackendPressureActivationResult(
               activationId,
               BackendPressureActivationResult.NotReady,
-              "active_ack_returned_activation_id")
+              "active_ack_returned_activation_id",
+              metadata.attemptId)
         }
       case None =>
         Future.failed(RejectRequest(BadRequest, "C1 backend-pressure source supports primitive actions only"))
@@ -204,37 +229,51 @@ protected[actions] trait PrimitiveActions {
     user: Identity,
     action: WhiskActionMetaData,
     payload: Option[JsValue],
-    metadata: BackendPressureMetadata)(implicit transid: TransactionId): Future[BackendPressureActivationResult] = {
+    metadata: BackendPressureMetadata,
+    schedulerFallbackRetryLimit: Int = 0)(implicit transid: TransactionId): Future[BackendPressureActivationResult] = {
     action.toExecutableWhiskAction match {
       case Some(executable) if executable.exec.deprecated =>
         Future.failed(RejectRequest(BadRequest, runtimeDeprecated(action.exec)))
       case Some(executable) if executable.annotations.isTruthy(WhiskActivation.conductorAnnotation) =>
         Future.failed(RejectRequest(BadRequest, "C1 backend-pressure source supports primitive actions only"))
       case Some(executable) =>
-        invokeSimpleAction(
-          user,
-          executable,
-          payload,
-          Some(executable.limits.timeout.duration + 1.minute),
-          cause = None,
-          backendPressure = Some(metadata)).map {
-          case Right(activation) =>
-            val (status, reason) =
-              if (activation.response.isWhiskError) {
-                (BackendPressureActivationResult.Failed, "blocking_activation_result_failed")
-              } else {
-                (BackendPressureActivationResult.Completed, "blocking_activation_result_ready")
-              }
-            BackendPressureActivationResult(
-              activation.activationId,
-              status,
-              reason)
-          case Left(activationId) =>
-            BackendPressureActivationResult(
-              activationId,
-              BackendPressureActivationResult.NotReady,
-              "blocking_activation_result_not_ready")
+        def invokeWithRetry(currentMetadata: BackendPressureMetadata,
+                            remainingRetries: Int): Future[BackendPressureActivationResult] = {
+          invokeSimpleAction(
+            user,
+            executable,
+            payload,
+            Some(executable.limits.timeout.duration + 1.minute),
+            cause = None,
+            backendPressure = Some(currentMetadata)).flatMap {
+            case Right(activation) if isC1BackendPressureSchedulerFallback(activation) && remainingRetries > 0 =>
+              emitC1BackendPressureSchedulerFallbackRetry(currentMetadata, activation, remainingRetries)
+              invokeWithRetry(currentMetadata.copy(attemptId = currentMetadata.attemptId + 1), remainingRetries - 1)
+            case Right(activation) =>
+              val (status, reason) =
+                if (isC1BackendPressureSchedulerFallback(activation) && schedulerFallbackRetryLimit > 0) {
+                  (BackendPressureActivationResult.Failed, "scheduler_internal_fallback_exhausted")
+                } else if (activation.response.isWhiskError) {
+                  (BackendPressureActivationResult.Failed, "blocking_activation_result_failed")
+                } else {
+                  (BackendPressureActivationResult.Completed, "blocking_activation_result_ready")
+                }
+              Future.successful(
+                BackendPressureActivationResult(
+                  activation.activationId,
+                  status,
+                  reason,
+                  currentMetadata.attemptId))
+            case Left(activationId) =>
+              Future.successful(
+                BackendPressureActivationResult(
+                  activationId,
+                  BackendPressureActivationResult.NotReady,
+                  "blocking_activation_result_not_ready",
+                  currentMetadata.attemptId))
+          }
         }
+        invokeWithRetry(metadata, math.max(0, schedulerFallbackRetryLimit))
       case None =>
         Future.failed(RejectRequest(BadRequest, "C1 backend-pressure source supports primitive actions only"))
     }

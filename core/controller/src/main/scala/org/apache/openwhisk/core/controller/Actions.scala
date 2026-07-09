@@ -144,7 +144,9 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                               plateau_warmup_completions: Option[Int] = None,
                                               plateau_warmup_sec: Option[Int] = None,
                                               plateau_no_improve_sec: Option[Int] = None,
-                                              plateau_min_improvement_fraction: Option[Double] = None)
+                                              plateau_min_improvement_fraction: Option[Double] = None,
+                                              scheduler_fallback_retry_enabled: Option[Boolean] = None,
+                                              scheduler_fallback_retry_limit: Option[Int] = None)
 
   private implicit object C1BackendPressureRequestFormat extends RootJsonFormat[C1BackendPressureRequest] {
     private def required[T](fields: Map[String, JsValue], name: String)(implicit reader: JsonReader[T]): T =
@@ -186,7 +188,9 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         plateau_warmup_completions = optional[Int](fields, "plateau_warmup_completions"),
         plateau_warmup_sec = optional[Int](fields, "plateau_warmup_sec"),
         plateau_no_improve_sec = optional[Int](fields, "plateau_no_improve_sec"),
-        plateau_min_improvement_fraction = optional[Double](fields, "plateau_min_improvement_fraction"))
+        plateau_min_improvement_fraction = optional[Double](fields, "plateau_min_improvement_fraction"),
+        scheduler_fallback_retry_enabled = optional[Boolean](fields, "scheduler_fallback_retry_enabled"),
+        scheduler_fallback_retry_limit = optional[Int](fields, "scheduler_fallback_retry_limit"))
     }
 
     override def write(request: C1BackendPressureRequest): JsValue = {
@@ -218,7 +222,9 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         request.plateau_warmup_completions.map("plateau_warmup_completions" -> JsNumber(_)),
         request.plateau_warmup_sec.map("plateau_warmup_sec" -> JsNumber(_)),
         request.plateau_no_improve_sec.map("plateau_no_improve_sec" -> JsNumber(_)),
-        request.plateau_min_improvement_fraction.map("plateau_min_improvement_fraction" -> JsNumber(_))).flatten.toMap
+        request.plateau_min_improvement_fraction.map("plateau_min_improvement_fraction" -> JsNumber(_)),
+        request.scheduler_fallback_retry_enabled.map("scheduler_fallback_retry_enabled" -> JsBoolean(_)),
+        request.scheduler_fallback_retry_limit.map("scheduler_fallback_retry_limit" -> JsNumber(_))).flatten.toMap
       JsObject(baseFields ++ optionalFields)
     }
   }
@@ -296,7 +302,13 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
           errorIf(request.plateau_no_improve_sec.nonEmpty, "plateau_no_improve_sec is only valid for completion_window"),
           errorIf(
             request.plateau_min_improvement_fraction.nonEmpty,
-            "plateau_min_improvement_fraction is only valid for completion_window"))
+            "plateau_min_improvement_fraction is only valid for completion_window"),
+          errorIf(
+            request.scheduler_fallback_retry_enabled.nonEmpty,
+            "scheduler_fallback_retry_enabled is only valid for completion_window"),
+          errorIf(
+            request.scheduler_fallback_retry_limit.nonEmpty,
+            "scheduler_fallback_retry_limit is only valid for completion_window"))
       case `c1BackendPressureRequestModeRamp` | `c1BackendPressureRequestModeStageGatedRamp` =>
         val schedule = request.ramp_rate_schedule_per_sec.getOrElse(Vector.empty)
         val stageDuration = request.ramp_stage_duration_sec.getOrElse(0)
@@ -345,7 +357,13 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
           errorIf(request.plateau_no_improve_sec.nonEmpty, "plateau_no_improve_sec is only valid for completion_window"),
           errorIf(
             request.plateau_min_improvement_fraction.nonEmpty,
-            "plateau_min_improvement_fraction is only valid for completion_window"))
+            "plateau_min_improvement_fraction is only valid for completion_window"),
+          errorIf(
+            request.scheduler_fallback_retry_enabled.nonEmpty,
+            "scheduler_fallback_retry_enabled is only valid for completion_window"),
+          errorIf(
+            request.scheduler_fallback_retry_limit.nonEmpty,
+            "scheduler_fallback_retry_limit is only valid for completion_window"))
       case `c1BackendPressureRequestModeCompletionWindow` =>
         Seq(
           errorIf(
@@ -377,7 +395,10 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
           errorIf(request.plateau_no_improve_sec.exists(_ <= 0), "plateau_no_improve_sec must be positive"),
           errorIf(
             request.plateau_min_improvement_fraction.exists(_ < 0.0),
-            "plateau_min_improvement_fraction must be non-negative"))
+            "plateau_min_improvement_fraction must be non-negative"),
+          errorIf(
+            request.scheduler_fallback_retry_limit.exists(_ < 0),
+            "scheduler_fallback_retry_limit must be non-negative"))
       case _ =>
         Seq(Some(s"request_generation_mode must be $c1BackendPressureRequestModeOpenLoop, $c1BackendPressureRequestModeRamp, $c1BackendPressureRequestModeStageGatedRamp, or $c1BackendPressureRequestModeCompletionWindow"))
     }
@@ -452,6 +473,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         JsObject(
           "logical_request_id" -> JsString(logicalRequestId),
           "activation_id" -> JsString(result.activationId.asString),
+          "attempt_id" -> JsNumber(result.attemptId),
           "status" -> JsString(result.status),
           "reason" -> JsString(result.reason))
       case C1BackendPressureOutcome(logicalRequestId, Left(error), _) =>
@@ -567,11 +589,11 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                                rollingQps: Option[Double] = None,
                                                rollingWindowSize: Option[Int] = None,
                                                plateauDecision: Option[String] = None): Unit = {
-    val (completionStatus, completionReason, activationId) = outcome.result match {
+    val (completionStatus, completionReason, activationId, attemptId) = outcome.result match {
       case Right(result) =>
-        (result.status, result.reason, result.activationId.asString)
+        (result.status, result.reason, result.activationId.asString, result.attemptId.toString)
       case Left(reason) =>
-        (BackendPressureActivationResult.Failed, reason, "")
+        (BackendPressureActivationResult.Failed, reason, "", "")
     }
     val fields = Seq(
       "run_id" -> request.run_id,
@@ -580,6 +602,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       "completion_signal" -> "blocking_activation_result",
       "terminal_audit" -> "blocking_activation_result_plus_N800_or_OW800_postrun",
       "logical_request_id" -> logicalRequestId,
+      "attempt_id" -> attemptId,
       "activation_id" -> activationId,
       "submitted_so_far" -> submittedSoFar.toString,
       "completed_so_far" -> completedSoFar.toString,
@@ -600,11 +623,13 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                             logicalRequestId: String,
                                             status: String,
                                             reason: String,
-                                            activationId: Option[ActivationId] = None)(
+                                            activationId: Option[ActivationId] = None,
+                                            attemptId: Option[Int] = None)(
     implicit transid: TransactionId): Unit = {
     val fields = Seq(
       Some("run_id" -> runId),
       Some("logical_request_id" -> logicalRequestId),
+      attemptId.map(id => "attempt_id" -> id.toString),
       activationId.map(id => "activation_id" -> id.asString),
       Some("status" -> status),
       Some("reason" -> reason),
@@ -621,7 +646,8 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                       plannedSubmitMonoNs: Long,
                                       actualSubmitMonoNs: Long,
                                       sourceScheduleLagNs: Long,
-                                      requireTerminalActivationResult: Boolean = false)(
+                                      requireTerminalActivationResult: Boolean = false,
+                                      schedulerFallbackRetryLimit: Int = 0)(
     implicit parentTransid: TransactionId): Future[C1BackendPressureOutcome] = {
     val logicalRequestIdString = scheduleEntry.logicalRequestId.toString
     val logicalTransid = TransactionId.childOf(parentTransid)
@@ -645,8 +671,12 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
 
     val invocation =
       if (requireTerminalActivationResult) {
-        invokeBackendPressureBlockingAction(user, action, Some(c1BackendPressurePayload(request, scheduleEntry)), metadata)(
-          logicalTransid)
+        invokeBackendPressureBlockingAction(
+          user,
+          action,
+          Some(c1BackendPressurePayload(request, scheduleEntry)),
+          metadata,
+          schedulerFallbackRetryLimit)(logicalTransid)
       } else {
         invokeBackendPressureAction(user, action, Some(c1BackendPressurePayload(request, scheduleEntry)), metadata)(
           logicalTransid)
@@ -660,7 +690,8 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             logicalRequestIdString,
             result.status,
             result.reason,
-            Some(result.activationId))(logicalTransid)
+            Some(result.activationId),
+            Some(result.attemptId))(logicalTransid)
         }
         C1BackendPressureOutcome(logicalRequestIdString, Right(result), sourceScheduleLagNs)
       }
@@ -894,6 +925,9 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
     val plateauWarmupNs = request.plateau_warmup_sec.getOrElse(10).toLong * 1000000000L
     val plateauNoImproveNs = request.plateau_no_improve_sec.getOrElse(10).toLong * 1000000000L
     val plateauMinImprovementFraction = request.plateau_min_improvement_fraction.getOrElse(0.03)
+    val schedulerFallbackRetryEnabled = request.scheduler_fallback_retry_enabled.getOrElse(false)
+    val schedulerFallbackRetryLimit =
+      if (schedulerFallbackRetryEnabled) request.scheduler_fallback_retry_limit.getOrElse(0) else 0
 
     def plateauRunDecisionFields(state: C1BackendPressurePlateauState,
                                  completionCount: Int,
@@ -909,7 +943,9 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         "plateau_elapsed_ns" -> elapsedNs.toString,
         "plateau_best_rolling_qps" -> state.bestRollingQps.toString,
         "plateau_current_rolling_qps" -> state.currentRollingQps.toString,
-        "plateau_best_completion_elapsed_ns" -> state.bestCompletionElapsedNs.toString)
+        "plateau_best_completion_elapsed_ns" -> state.bestCompletionElapsedNs.toString,
+        "scheduler_fallback_retry_enabled" -> schedulerFallbackRetryEnabled.toString,
+        "scheduler_fallback_retry_limit" -> schedulerFallbackRetryLimit.toString)
 
     def updatePlateauState(previous: C1BackendPressurePlateauState,
                            completionTimesNs: Vector[Long],
@@ -954,7 +990,8 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         actualSubmitMonoNs,
         actualSubmitMonoNs,
         0L,
-        requireTerminalActivationResult = true)
+        requireTerminalActivationResult = true,
+        schedulerFallbackRetryLimit = schedulerFallbackRetryLimit)
     }
 
     def loop(nextLogicalRequestId: Int,

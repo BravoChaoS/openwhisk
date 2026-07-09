@@ -45,11 +45,13 @@ protected[controller] case class BackendPressureMetadata(runId: String,
                                                          plannedSubmitOffsetNs: Option[Long] = None,
                                                          plannedSubmitMonoNs: Long = 0L,
                                                          actualSubmitMonoNs: Long = 0L,
-                                                         sourceScheduleLagNs: Long = 0L)
+                                                         sourceScheduleLagNs: Long = 0L,
+                                                         attemptId: Int = 1)
 
 protected[controller] case class BackendPressureActivationResult(activationId: ActivationId,
                                                                  status: String,
-                                                                 reason: String) {
+                                                                 reason: String,
+                                                                 attemptId: Int = 1) {
   def completed: Boolean = status == BackendPressureActivationResult.Completed
   def failed: Boolean = status == BackendPressureActivationResult.Failed
   def notReady: Boolean = status == BackendPressureActivationResult.NotReady
