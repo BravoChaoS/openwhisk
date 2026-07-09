@@ -861,16 +861,16 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             logicalRequestId.toString == outcome.logicalRequestId
           }
           val completedSoFar = accumulated.size + 1
-          val terminalCompletion = outcome.result match {
-            case Right(result) => result.completed
+          val terminalResult = outcome.result match {
+            case Right(result) => result.completed || result.failed
             case Left(_)       => false
           }
           val (newNextLogicalRequestId, nextInFlight, refillLogicalRequestId) =
-            if (terminalCompletion && nextLogicalRequestId <= targetLogicalRequests) {
+            if (terminalResult && nextLogicalRequestId <= targetLogicalRequests) {
               val refill = launch(nextLogicalRequestId)
               (nextLogicalRequestId + 1, remaining :+ refill, Some(nextLogicalRequestId))
             } else {
-              (nextLogicalRequestId, if (terminalCompletion) remaining else Vector.empty, None)
+              (nextLogicalRequestId, if (terminalResult) remaining else Vector.empty, None)
             }
           emitC1BackendPressureWindowEvent(
             request,
@@ -880,7 +880,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             inFlightAfterCompletion = nextInFlight.size,
             nextLogicalRequestId = refillLogicalRequestId,
             outcome = outcome)
-          if (terminalCompletion) {
+          if (terminalResult) {
             loop(newNextLogicalRequestId, nextInFlight, accumulated :+ outcome)
           } else {
             val reason = outcome.result match {

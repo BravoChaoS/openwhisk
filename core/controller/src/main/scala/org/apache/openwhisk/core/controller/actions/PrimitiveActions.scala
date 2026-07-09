@@ -219,10 +219,16 @@ protected[actions] trait PrimitiveActions {
           cause = None,
           backendPressure = Some(metadata)).map {
           case Right(activation) =>
+            val (status, reason) =
+              if (activation.response.isWhiskError) {
+                (BackendPressureActivationResult.Failed, "blocking_activation_result_failed")
+              } else {
+                (BackendPressureActivationResult.Completed, "blocking_activation_result_ready")
+              }
             BackendPressureActivationResult(
               activation.activationId,
-              BackendPressureActivationResult.Completed,
-              "blocking_activation_result_ready")
+              status,
+              reason)
           case Left(activationId) =>
             BackendPressureActivationResult(
               activationId,
