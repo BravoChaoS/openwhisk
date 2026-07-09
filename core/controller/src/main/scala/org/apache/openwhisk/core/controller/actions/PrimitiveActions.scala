@@ -119,8 +119,14 @@ protected[actions] trait PrimitiveActions {
   private def isC1BackendPressureScheduledActionFailure(activation: WhiskActivation): Boolean =
     activation.response.result.exists {
       case JsObject(fields) =>
-        fields.get("scheduled_failure").contains(JsBoolean(true)) ||
-          fields.get("failure_type").contains(JsString("scheduled_failure"))
+        def scheduledFailureMarker(values: Map[String, JsValue]) =
+          values.get("scheduled_failure").contains(JsBoolean(true)) ||
+            values.get("failure_type").contains(JsString("scheduled_failure"))
+        scheduledFailureMarker(fields) ||
+          fields.get(ActivationResponse.ERROR_FIELD).exists {
+            case JsObject(errorFields) => scheduledFailureMarker(errorFields)
+            case _                     => false
+          }
       case _ => false
     }
 

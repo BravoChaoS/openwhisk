@@ -281,24 +281,28 @@ class FunctionPullingContainerProxy(
     if (shouldSkipBackendPressureActivationStore(msg)) {
       activation.response.result match {
         case Some(JsObject(fields)) =>
-          val runId = c1BackendPressureResultField(fields, "run_id")
-          val logicalRequestId = c1BackendPressureResultField(fields, "logical_request_id")
-          val workloadDurationNs = c1BackendPressureResultField(fields, "workload_duration_ns")
+          val resultFields = fields.get(ExecutionResponse.ERROR_FIELD) match {
+            case Some(JsObject(errorFields)) => errorFields
+            case _                           => fields
+          }
+          val runId = c1BackendPressureResultField(resultFields, "run_id")
+          val logicalRequestId = c1BackendPressureResultField(resultFields, "logical_request_id")
+          val workloadDurationNs = c1BackendPressureResultField(resultFields, "workload_duration_ns")
           if (runId.isDefined && logicalRequestId.isDefined && workloadDurationNs.isDefined) {
             val markerFields = Seq(
               c1TimingField("run_id", runId.get),
               c1TimingField("logical_request_id", logicalRequestId.get),
               c1TimingField("activation_id", msg.activationId.asString),
-              c1TimingField("workload_id", c1BackendPressureResultField(fields, "workload_id").getOrElse("")),
-              c1TimingField("workload_kind", c1BackendPressureResultField(fields, "workload_kind").getOrElse("")),
+              c1TimingField("workload_id", c1BackendPressureResultField(resultFields, "workload_id").getOrElse("")),
+              c1TimingField("workload_kind", c1BackendPressureResultField(resultFields, "workload_kind").getOrElse("")),
               c1TimingField("workload_duration_ns", workloadDurationNs.get),
-              c1TimingField("compress_mode", c1BackendPressureResultField(fields, "workload_compress_mode").getOrElse("")),
-              c1TimingField("compress_bytes", c1BackendPressureResultField(fields, "workload_compress_bytes").getOrElse("")),
-              c1TimingField("compress_level", c1BackendPressureResultField(fields, "workload_compress_level").getOrElse("")),
-              c1TimingField("output_bytes", c1BackendPressureResultField(fields, "workload_output_bytes").getOrElse("")),
-              c1TimingField("failure_probability", c1BackendPressureResultField(fields, "failure_probability").getOrElse("")),
-              c1TimingField("scheduled_failure", c1BackendPressureResultField(fields, "scheduled_failure").getOrElse("")),
-              c1TimingField("failure_reason", c1BackendPressureResultField(fields, "failure_reason").getOrElse("")))
+              c1TimingField("compress_mode", c1BackendPressureResultField(resultFields, "workload_compress_mode").getOrElse("")),
+              c1TimingField("compress_bytes", c1BackendPressureResultField(resultFields, "workload_compress_bytes").getOrElse("")),
+              c1TimingField("compress_level", c1BackendPressureResultField(resultFields, "workload_compress_level").getOrElse("")),
+              c1TimingField("output_bytes", c1BackendPressureResultField(resultFields, "workload_output_bytes").getOrElse("")),
+              c1TimingField("failure_probability", c1BackendPressureResultField(resultFields, "failure_probability").getOrElse("")),
+              c1TimingField("scheduled_failure", c1BackendPressureResultField(resultFields, "scheduled_failure").getOrElse("")),
+              c1TimingField("failure_reason", c1BackendPressureResultField(resultFields, "failure_reason").getOrElse("")))
             logging.info(this, s"C1_BACKEND_PRESSURE_WORKLOAD_TIMING|${markerFields.mkString("|")}")(msg.transid)
           }
         case _ =>
