@@ -270,6 +270,39 @@ class FunctionPullingContainerProxy(
     }
   }
 
+  private def c1BackendPressureResultField(fields: Map[String, JsValue], key: String): Option[String] =
+    fields.get(key).collect {
+      case JsString(value)  => value
+      case JsNumber(value)  => value.toString
+      case JsBoolean(value) => value.toString
+    }
+
+  private def emitC1BackendPressureWorkloadTiming(msg: ActivationMessage, activation: WhiskActivation): Unit = {
+    if (shouldSkipBackendPressureActivationStore(msg)) {
+      activation.response.result match {
+        case Some(JsObject(fields)) =>
+          val runId = c1BackendPressureResultField(fields, "run_id")
+          val logicalRequestId = c1BackendPressureResultField(fields, "logical_request_id")
+          val workloadDurationNs = c1BackendPressureResultField(fields, "workload_duration_ns")
+          if (runId.isDefined && logicalRequestId.isDefined && workloadDurationNs.isDefined) {
+            val markerFields = Seq(
+              c1TimingField("run_id", runId.get),
+              c1TimingField("logical_request_id", logicalRequestId.get),
+              c1TimingField("activation_id", msg.activationId.asString),
+              c1TimingField("workload_id", c1BackendPressureResultField(fields, "workload_id").getOrElse("")),
+              c1TimingField("workload_kind", c1BackendPressureResultField(fields, "workload_kind").getOrElse("")),
+              c1TimingField("workload_duration_ns", workloadDurationNs.get),
+              c1TimingField("compress_mode", c1BackendPressureResultField(fields, "workload_compress_mode").getOrElse("")),
+              c1TimingField("compress_bytes", c1BackendPressureResultField(fields, "workload_compress_bytes").getOrElse("")),
+              c1TimingField("compress_level", c1BackendPressureResultField(fields, "workload_compress_level").getOrElse("")),
+              c1TimingField("output_bytes", c1BackendPressureResultField(fields, "workload_output_bytes").getOrElse("")))
+            logging.info(this, s"C1_BACKEND_PRESSURE_WORKLOAD_TIMING|${markerFields.mkString("|")}")(msg.transid)
+          }
+        case _ =>
+      }
+    }
+  }
+
   private def emitC1TimingEvent(eventCode: String, boundaryName: String, msg: ActivationMessage): Unit = {
     val unixNs = System.currentTimeMillis() * 1000000L
     val monoNs = System.nanoTime()
@@ -1287,6 +1320,7 @@ class FunctionPullingContainerProxy(
     }
 
     activation.foreach { activation =>
+      emitC1BackendPressureWorkloadTiming(msg, activation)
       val healthMessage = HealthMessage(!activation.response.isWhiskError)
       invokerHealthManager ! healthMessage
     }
