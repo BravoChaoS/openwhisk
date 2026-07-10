@@ -44,6 +44,7 @@
     readers:
     - "{{ db.credentials.controller.user }}"
     - "{{ db.credentials.invoker.user }}"
+    - "{{ db.credentials.scheduler.user }}"
 
 - include_tasks: db/recreateDb.yml
   vars:
@@ -56,6 +57,7 @@
     readers:
     - "{{ db.credentials.controller.user }}"
     - "{{ db.credentials.invoker.user }}"
+    - "{{ db.credentials.scheduler.user }}"
 
 - include_tasks: db/recreateDoc.yml
   vars:
