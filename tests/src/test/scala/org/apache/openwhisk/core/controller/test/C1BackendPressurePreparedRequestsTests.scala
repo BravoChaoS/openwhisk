@@ -57,7 +57,7 @@ class C1BackendPressurePreparedRequestsTests extends AnyFlatSpec with Matchers w
       binding = Some(EntityPath("fixture-namespace/source-package")))
       .revision[WhiskActionMetaData](DocRevision("7-fixture-revision"))
 
-  private def writeSource(action: WhiskActionMetaData, count: Int = 3): Unit = {
+  private def writeSource(count: Int = 3): Unit = {
     val rows = (1 to count).map { ordinal =>
       JsObject(
         "action_params" -> JsObject(
@@ -70,12 +70,9 @@ class C1BackendPressurePreparedRequestsTests extends AnyFlatSpec with Matchers w
     }
     val requestBytes = (rows.mkString("\n") + "\n").getBytes(StandardCharsets.UTF_8)
     Files.write(root.resolve("requests.jsonl"), requestBytes)
-    val identity = C1BackendPressurePreparedRequests.actionIdentity(action)
     val manifest = JsObject(
       "action" -> JsObject(
-        "canonical_fqen" -> identity.canonicalFqen,
-        "requested_action" -> JsString("fixture-provenance-only"),
-        "revision" -> JsString(identity.revision)),
+        "requested_action" -> JsString("fixture-provenance-only")),
       "configured_request_count" -> JsNumber(count),
       "failure_probability" -> JsNumber(0),
       "requests_file" -> JsString("requests.jsonl"),
@@ -87,14 +84,12 @@ class C1BackendPressurePreparedRequestsTests extends AnyFlatSpec with Matchers w
 
   behavior of "C1 backend-pressure prepared request source"
 
-  it should "load sequential action parameters bound to canonical action metadata" in {
-    val action = actionMetaData()
-    writeSource(action)
+  it should "load sequential action parameters without provider-owned resolved identity" in {
+    writeSource()
 
     val result = C1BackendPressurePreparedRequests.load(
       root.toString,
       expectedCount = 3,
-      expectedAction = C1BackendPressurePreparedRequests.actionIdentity(action),
       expectedWorkloadId = "asyncs-wasm-gzip-level6-mixed-512k")
 
     result.isRight shouldBe true
@@ -105,41 +100,20 @@ class C1BackendPressurePreparedRequestsTests extends AnyFlatSpec with Matchers w
     requests(1).actionParams.fields("encrypted_input") shouldBe JsString("ciphertext-2")
   }
 
-  it should "reject a source bound to a different canonical revision" in {
+  it should "derive canonical identity from resolved action metadata" in {
     val action = actionMetaData()
-    writeSource(action)
-    val differentRevision = C1BackendPressurePreparedRequests
-      .actionIdentity(action)
-      .copy(revision = "8-different-revision")
-
-    val result = C1BackendPressurePreparedRequests.load(
-      root.toString,
-      expectedCount = 3,
-      expectedAction = differentRevision,
-      expectedWorkloadId = "asyncs-wasm-gzip-level6-mixed-512k")
-
-    result.left.get should include("revision")
-  }
-
-  it should "reject a source bound to a different canonical FQEN" in {
-    val action = actionMetaData()
-    writeSource(action)
     val identity = C1BackendPressurePreparedRequests.actionIdentity(action)
-    val differentFqen = identity.copy(
-      canonicalFqen = JsObject(identity.canonicalFqen.fields + ("name" -> JsString("different-action"))))
 
-    val result = C1BackendPressurePreparedRequests.load(
-      root.toString,
-      expectedCount = 3,
-      expectedAction = differentFqen,
-      expectedWorkloadId = "asyncs-wasm-gzip-level6-mixed-512k")
-
-    result.left.get should include("canonical_fqen")
+    identity.canonicalFqen shouldBe JsObject(
+      "path" -> JsString("fixture-namespace/fixture-package"),
+      "name" -> JsString("asyncs_backend_pressure_fixture"),
+      "version" -> JsString("1.2.3"),
+      "binding" -> JsString("fixture-namespace/source-package"))
+    identity.revision shouldBe "7-fixture-revision"
   }
 
   it should "reject reordered rows even when their file hash matches the manifest" in {
-    val action = actionMetaData()
-    writeSource(action)
+    writeSource()
     val requestsPath = root.resolve("requests.jsonl")
     val reordered = Files.readAllLines(requestsPath, StandardCharsets.UTF_8).asScala.reverse.mkString("\n") + "\n"
     Files.write(requestsPath, reordered.getBytes(StandardCharsets.UTF_8))
@@ -151,7 +125,6 @@ class C1BackendPressurePreparedRequestsTests extends AnyFlatSpec with Matchers w
     val result = C1BackendPressurePreparedRequests.load(
       root.toString,
       expectedCount = 3,
-      expectedAction = C1BackendPressurePreparedRequests.actionIdentity(action),
       expectedWorkloadId = "asyncs-wasm-gzip-level6-mixed-512k")
 
     result.left.get should include("out of order")

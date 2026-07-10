@@ -142,7 +142,6 @@ private[controller] object C1BackendPressurePreparedRequests {
 
   private def loadUnsafe(sourceDirectory: String,
                          expectedCount: Int,
-                         expectedAction: C1BackendPressureActionIdentity,
                          expectedWorkloadId: String): Vector[C1BackendPressurePreparedRequest] = {
     val source = Paths.get(sourceDirectory)
     val manifestPath = source.resolve("manifest.json")
@@ -158,13 +157,6 @@ private[controller] object C1BackendPressurePreparedRequests {
     }
     if (manifest.get("failure_probability").map(_.convertTo[Double]).getOrElse(-1.0) != 0.0) {
       deserializationError("prepared request failure_probability must be 0")
-    }
-    val action = requiredObject(manifest, "action").fields
-    if (requiredObject(action, "canonical_fqen") != expectedAction.canonicalFqen) {
-      deserializationError("prepared request canonical_fqen does not match resolved action")
-    }
-    if (requiredString(action, "revision") != expectedAction.revision) {
-      deserializationError("prepared request revision does not match resolved action")
     }
     val workload = requiredObject(manifest, "workload").fields
     if (requiredString(workload, "workload_id") != expectedWorkloadId) {
@@ -221,10 +213,9 @@ private[controller] object C1BackendPressurePreparedRequests {
 
   def load(sourceDirectory: String,
            expectedCount: Int,
-           expectedAction: C1BackendPressureActionIdentity,
            expectedWorkloadId: String): Either[String, Vector[C1BackendPressurePreparedRequest]] =
     try {
-      Right(loadUnsafe(sourceDirectory, expectedCount, expectedAction, expectedWorkloadId))
+      Right(loadUnsafe(sourceDirectory, expectedCount, expectedWorkloadId))
     } catch {
       case NonFatal(error) => Left(Option(error.getMessage).getOrElse(error.getClass.getSimpleName))
     }
@@ -673,6 +664,23 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
     logging.info(
       this,
       s"C1_BACKEND_PRESSURE_STATUS|run_id=${c1BackendPressureValue(runId)}|submitted=$submitted|completed=$completed|failed=$failed|not_ready=$notReady|mode=$c1BackendPressureMode")
+  }
+
+  private def emitC1BackendPressureResolvedAction(request: C1BackendPressureRequest,
+                                                  action: WhiskActionMetaData): Unit = {
+    val identity = C1BackendPressurePreparedRequests.actionIdentity(action)
+    val fields = Seq(
+      "run_id" -> request.run_id,
+      "profile" -> request.profile,
+      "request_generation_mode" -> request.request_generation_mode,
+      "requested_action" -> request.action,
+      "prepared_request_source" -> request.prepared_request_source.getOrElse(""),
+      "resolved_canonical_fqen" -> identity.canonicalFqen.compactPrint,
+      "resolved_action_revision" -> identity.revision,
+      "evidence_phase" -> "premeasurement").map {
+      case (key, value) => s"$key=${c1BackendPressureValue(value)}"
+    }
+    logging.info(this, s"C1_BACKEND_PRESSURE_RESOLVED_ACTION|${fields.mkString("|")}")
   }
 
   private def emitC1BackendPressureStageDecision(request: C1BackendPressureRequest,
@@ -1296,7 +1304,6 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                 .load(
                                   request.prepared_request_source.get,
                                   request.planned_logical_requests,
-                                  C1BackendPressurePreparedRequests.actionIdentity(action),
                                   request.workload_id)
                                 .map(requests => Some(requests))
                             } else {
@@ -1306,6 +1313,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                             case Left(error) =>
                               terminate(BadRequest, s"prepared request source is invalid: $error")
                             case Right(preparedRequests) =>
+                              preparedRequests.foreach(_ => emitC1BackendPressureResolvedAction(request, action))
                               val submitted = request.planned_logical_requests
                               if (
                                 request.request_generation_mode == c1BackendPressureRequestModeRamp ||
