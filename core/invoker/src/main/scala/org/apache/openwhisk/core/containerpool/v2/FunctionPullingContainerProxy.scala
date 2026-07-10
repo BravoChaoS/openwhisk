@@ -245,9 +245,11 @@ class FunctionPullingContainerProxy(
 
   private def c1TimingField(key: String, value: String): String = s"$key=${c1TimingSanitize(value)}"
 
+  private def isBackendPressureActivation(msg: ActivationMessage): Boolean =
+    msg.metrics.get("c1_backend_pressure").contains(1L)
+
   private def shouldSkipBackendPressureActivationStore(msg: ActivationMessage): Boolean =
-    sys.env.get("C1_BACKEND_PRESSURE_SKIP_ACTIVATION_STORE").contains("1") &&
-      msg.metrics.get("c1_backend_pressure").contains(1L)
+    sys.env.get("C1_BACKEND_PRESSURE_SKIP_ACTIVATION_STORE").contains("1") && isBackendPressureActivation(msg)
 
   private def guardedStoreActivation(
     tid: TransactionId,
@@ -309,6 +311,16 @@ class FunctionPullingContainerProxy(
       }
     }
   }
+
+  private def emitC1BackendPressureAsynCSEvidence(msg: ActivationMessage, activation: WhiskActivation): Unit =
+    FunctionPullingContainerProxy
+      .c1BackendPressureAsynCSEvidenceLines(
+        isBackendPressureActivation(msg),
+        activation.response.result,
+        msg.activationId.asString,
+        c1TimingNode,
+        msg.transid.id)
+      .foreach(line => logging.info(this, line)(msg.transid))
 
   private def emitC1TimingEvent(eventCode: String, boundaryName: String, msg: ActivationMessage): Unit = {
     val unixNs = System.currentTimeMillis() * 1000000L
@@ -1328,6 +1340,7 @@ class FunctionPullingContainerProxy(
 
     activation.foreach { activation =>
       emitC1BackendPressureWorkloadTiming(msg, activation)
+      emitC1BackendPressureAsynCSEvidence(msg, activation)
       val healthMessage = HealthMessage(!activation.response.isWhiskError)
       invokerHealthManager ! healthMessage
     }
@@ -1427,6 +1440,108 @@ class FunctionPullingContainerProxy(
 }
 
 object FunctionPullingContainerProxy {
+  private val c1AsynCSProducerEventCodes =
+    Set("A200", "A210", "A300", "A310", "A320", "A330", "A340", "A350", "A400", "A410")
+  private val c1AsynCSTraceEvidenceFields = Seq(
+    "worker_started_this_invocation",
+    "worker_restart_reason",
+    "kms_contacted",
+    "enclave_key_cache_hit",
+    "worker_invoke_rc",
+    "container_hostname",
+    "crypto_profile",
+    "key_ciphertext_format",
+    "function_cache_hit",
+    "cfunc_decrypt_executed",
+    "function_cache_bytes",
+    "payload_bytes_consumed",
+    "payload_sha256")
+
+  private def c1EvidenceValue(value: JsValue): Option[String] = value match {
+    case JsString(content) => Some(content)
+    case JsNumber(content) => Some(content.toString)
+    case JsBoolean(content) => Some(content.toString)
+    case _ => None
+  }
+
+  private def c1EvidenceField(fields: Map[String, JsValue], key: String): Option[String] =
+    fields.get(key).flatMap(c1EvidenceValue)
+
+  private def c1EvidenceSanitize(value: String): String =
+    value.replace('|', '_').replace('\n', ' ').replace('\r', ' ')
+
+  private def c1EvidenceLine(prefix: String, fields: Seq[(String, String)]): String =
+    s"$prefix|${fields.map { case (key, value) => s"$key=${c1EvidenceSanitize(value)}" }.mkString("|")}"
+
+  private[containerpool] def c1BackendPressureAsynCSEvidenceLines(markedBackendPressure: Boolean,
+                                                                  result: Option[JsValue],
+                                                                  activationId: String,
+                                                                  node: String,
+                                                                  transactionId: String): Seq[String] = {
+    if (!markedBackendPressure) {
+      Seq.empty
+    } else {
+      result.toSeq.flatMap {
+        case JsObject(resultFields) =>
+          val errorFields = resultFields.get(ExecutionResponse.ERROR_FIELD).collect {
+            case JsObject(fields) => fields
+          }
+          val trace = resultFields
+            .get("trace")
+            .orElse(errorFields.flatMap(_.get("trace")))
+            .collect { case JsObject(fields) => fields }
+          val actualRid = c1EvidenceField(resultFields, "rid").orElse(errorFields.flatMap(c1EvidenceField(_, "rid")))
+
+          trace.toSeq.flatMap { traceFields =>
+            traceFields.get("producer_timing_events") match {
+              case Some(JsArray(events)) =>
+                val producerEvents = events.collect {
+                  case JsObject(fields)
+                      if c1EvidenceField(fields, "event_code").exists(c1AsynCSProducerEventCodes.contains) =>
+                    fields
+                }.take(c1AsynCSProducerEventCodes.size)
+                val firstEvent = producerEvents.headOption.getOrElse(Map.empty[String, JsValue])
+                val logicalRequestId = c1EvidenceField(firstEvent, "logical_request_id").getOrElse("")
+                val attemptId = c1EvidenceField(firstEvent, "attempt_id").getOrElse("")
+                val resultEvidence = c1EvidenceLine(
+                  "C1_BACKEND_PRESSURE_ASYNCS_RESULT",
+                  Seq(
+                    "activation_id" -> activationId,
+                    "logical_request_id" -> logicalRequestId,
+                    "attempt_id" -> attemptId,
+                    "actual_rid" -> actualRid.getOrElse(""),
+                    "node" -> node,
+                    "producer_event_count" -> producerEvents.size.toString) ++
+                    c1AsynCSTraceEvidenceFields.flatMap(key => c1EvidenceField(traceFields, key).map(key -> _)))
+                val timingEvents = producerEvents.map { eventFields =>
+                  val attrs = eventFields.get("attrs").collect { case JsObject(fields) => fields }.getOrElse(Map.empty)
+                  c1EvidenceLine(
+                    "C1TIMING_EVENT",
+                    Seq(
+                      "event_code" -> c1EvidenceField(eventFields, "event_code").getOrElse(""),
+                      "event_seq" -> c1EvidenceField(eventFields, "event_seq").getOrElse(""),
+                      "activation_id" -> activationId,
+                      "boundary_name" -> c1EvidenceField(attrs, "boundary").getOrElse(""),
+                      "logical_request_id" -> c1EvidenceField(eventFields, "logical_request_id").getOrElse(""),
+                      "attempt_id" -> c1EvidenceField(eventFields, "attempt_id").getOrElse(""),
+                      "node" -> node,
+                      "process" -> c1EvidenceField(eventFields, "process").getOrElse(""),
+                      "pid" -> c1EvidenceField(eventFields, "pid").getOrElse(""),
+                      "tid" -> c1EvidenceField(eventFields, "tid").filter(_.nonEmpty).getOrElse(transactionId),
+                      "unix_ns" -> c1EvidenceField(eventFields, "unix_ns").getOrElse(""),
+                      "mono_ns" -> c1EvidenceField(eventFields, "mono_ns").getOrElse(""),
+                      "clock_domain" -> c1EvidenceField(eventFields, "clock_domain").getOrElse(""),
+                      "status" -> c1EvidenceField(eventFields, "status").getOrElse("observed")))
+                }
+                resultEvidence +: timingEvents
+              case _ => Seq.empty
+            }
+          }
+        case _ => Seq.empty
+      }
+    }
+  }
+
   private[containerpool] val c1InternalRescheduleInjectedActivations =
     new ConcurrentHashMap[String, java.lang.Boolean]
 

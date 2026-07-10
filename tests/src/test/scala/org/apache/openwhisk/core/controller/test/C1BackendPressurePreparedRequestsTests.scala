@@ -27,7 +27,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.junit.JUnitRunner
 import spray.json._
-import org.apache.openwhisk.core.controller.C1BackendPressurePreparedRequests
+import org.apache.openwhisk.core.controller.{C1BackendPressurePreparedRequest, C1BackendPressurePreparedRequests}
 import org.apache.openwhisk.core.entity.ExecManifest.ImageName
 import org.apache.openwhisk.core.entity._
 
@@ -110,6 +110,37 @@ class C1BackendPressurePreparedRequestsTests extends AnyFlatSpec with Matchers w
       "version" -> JsString("1.2.3"),
       "binding" -> JsString("fixture-namespace/source-package"))
     identity.revision shouldBe "7-fixture-revision"
+  }
+
+  it should "describe the real prepared request submit boundary without exposing request payloads" in {
+    val request = C1BackendPressurePreparedRequest(
+      ordinal = 2,
+      logicalRequestId = "2",
+      expectedRid = "expected-rid-2",
+      actionParams = JsObject("encrypted_input" -> JsString("must-not-be-logged")))
+
+    val fields = C1BackendPressurePreparedRequests.submitEvidenceFields(
+      runId = "backend-pressure-asyncs-p0",
+      request = request,
+      node = "controller0",
+      processId = "1234",
+      transactionId = "tid-2",
+      unixNs = 1000000000L,
+      monoNs = 200000L).toMap
+
+    fields("event_code") shouldBe "BP010"
+    fields("boundary_name") shouldBe "backend_pressure_request_generated"
+    fields("run_id") shouldBe "backend-pressure-asyncs-p0"
+    fields("logical_request_id") shouldBe "2"
+    fields("attempt_id") shouldBe "1"
+    fields("expected_rid") shouldBe "expected-rid-2"
+    fields("node") shouldBe "controller0"
+    fields("process") shouldBe "backend_pressure_controller"
+    fields("pid") shouldBe "1234"
+    fields("tid") shouldBe "tid-2"
+    fields("unix_ns") shouldBe "1000000000"
+    fields("mono_ns") shouldBe "200000"
+    fields.values.mkString("|") should not include "must-not-be-logged"
   }
 
   it should "reject reordered rows even when their file hash matches the manifest" in {

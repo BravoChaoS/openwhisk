@@ -17,6 +17,7 @@
 
 package org.apache.openwhisk.core.controller
 
+import java.lang.management.ManagementFactory
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
 import java.security.MessageDigest
@@ -112,6 +113,29 @@ private[controller] object C1BackendPressurePreparedRequests {
         "version" -> JsString(action.version.toString),
         "binding" -> action.binding.map(path => JsString(path.asString)).getOrElse(JsNull)),
       action.rev.asString)
+
+  def submitEvidenceFields(runId: String,
+                           request: C1BackendPressurePreparedRequest,
+                           node: String,
+                           processId: String,
+                           transactionId: String,
+                           unixNs: Long,
+                           monoNs: Long): Seq[(String, String)] =
+    Seq(
+      "event_code" -> "BP010",
+      "boundary_name" -> "backend_pressure_request_generated",
+      "run_id" -> runId,
+      "logical_request_id" -> request.logicalRequestId,
+      "attempt_id" -> "1",
+      "expected_rid" -> request.expectedRid,
+      "node" -> node,
+      "process" -> "backend_pressure_controller",
+      "pid" -> processId,
+      "tid" -> transactionId,
+      "unix_ns" -> unixNs.toString,
+      "mono_ns" -> monoNs.toString,
+      "clock_domain" -> "openwhisk_controller_jvm_mono",
+      "status" -> "observed")
 
   private def requiredString(fields: Map[String, JsValue], name: String): String =
     fields.get(name).map(_.convertTo[String]).getOrElse(deserializationError(s"$name is required"))
@@ -371,6 +395,9 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
   private val c1BackendPressureStageGatePolicySourceLagV1 = "source_lag_v1"
   private val c1BackendPressureControllerSourceEnv = "C1_BACKEND_PRESSURE_CONTROLLER_SOURCE"
   private val c1BackendPressureMaxPayloadBytes = 1048576
+  private val c1BackendPressureTimingProcessId = ManagementFactory.getRuntimeMXBean.getName.takeWhile(_ != '@')
+  private val c1BackendPressureTimingNode =
+    sys.env.get("C1_TIMING_NODE_ID").orElse(sys.env.get("HOSTNAME")).getOrElse("")
 
   private case class C1BackendPressureOutcome(logicalRequestId: String,
                                               result: Either[String, BackendPressureActivationResult],
@@ -681,6 +708,25 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       case (key, value) => s"$key=${c1BackendPressureValue(value)}"
     }
     logging.info(this, s"C1_BACKEND_PRESSURE_RESOLVED_ACTION|${fields.mkString("|")}")
+  }
+
+  private def emitC1BackendPressurePreparedSubmit(request: C1BackendPressureRequest,
+                                                  preparedRequest: C1BackendPressurePreparedRequest,
+                                                  unixNs: Long,
+                                                  monoNs: Long)(implicit transid: TransactionId): Unit = {
+    val fields = C1BackendPressurePreparedRequests
+      .submitEvidenceFields(
+        request.run_id,
+        preparedRequest,
+        c1BackendPressureTimingNode,
+        c1BackendPressureTimingProcessId,
+        transid.id,
+        unixNs,
+        monoNs)
+      .map {
+        case (key, value) => s"$key=${c1BackendPressureValue(value)}"
+      }
+    logging.info(this, s"C1TIMING_EVENT|${fields.mkString("|")}")
   }
 
   private def emitC1BackendPressureStageDecision(request: C1BackendPressureRequest,
@@ -1150,6 +1196,13 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       val scheduleEntry = C1BackendPressureScheduleEntry(
         logicalRequestId = logicalRequestId,
         plannedSubmitOffsetNs = plannedSubmitOffsetNs)
+      preparedRequests.foreach { requests =>
+        emitC1BackendPressurePreparedSubmit(
+          request,
+          requests(logicalRequestId - 1),
+          System.currentTimeMillis() * 1000000L,
+          actualSubmitMonoNs)
+      }
       logicalRequestId -> c1BackendPressureInvoke(
         user,
         action,
