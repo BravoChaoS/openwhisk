@@ -17,8 +17,12 @@
 
 package org.apache.openwhisk.core.controller
 
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Paths}
+import java.security.MessageDigest
 import scala.concurrent.Future
 import scala.concurrent.duration._
+import scala.util.control.NonFatal
 import scala.util.{Failure, Success, Try}
 import org.apache.kafka.common.errors.RecordTooLargeException
 import org.apache.pekko.actor.ActorSystem
@@ -90,6 +94,142 @@ object WhiskActionsApi {
   }
 }
 
+private[controller] final case class C1BackendPressurePreparedRequest(ordinal: Int,
+                                                                      logicalRequestId: String,
+                                                                      expectedRid: String,
+                                                                      actionParams: JsObject)
+
+private[controller] final case class C1BackendPressureActionIdentity(canonicalFqen: JsObject, revision: String)
+
+private[controller] object C1BackendPressurePreparedRequests {
+  private val schemaVersion = "c1-asyncs-premeasurement-requests-v1"
+
+  def actionIdentity(action: WhiskActionMetaData): C1BackendPressureActionIdentity =
+    C1BackendPressureActionIdentity(
+      JsObject(
+        "path" -> JsString(action.namespace.asString),
+        "name" -> JsString(action.name.asString),
+        "version" -> JsString(action.version.toString),
+        "binding" -> action.binding.map(path => JsString(path.asString)).getOrElse(JsNull)),
+      action.rev.asString)
+
+  private def requiredString(fields: Map[String, JsValue], name: String): String =
+    fields.get(name).map(_.convertTo[String]).getOrElse(deserializationError(s"$name is required"))
+
+  private def requiredInt(fields: Map[String, JsValue], name: String): Int =
+    fields.get(name).map(_.convertTo[Int]).getOrElse(deserializationError(s"$name is required"))
+
+  private def requiredObject(fields: Map[String, JsValue], name: String): JsObject =
+    fields.get(name).map(_.asJsObject).getOrElse(deserializationError(s"$name is required"))
+
+  private def sha256(path: java.nio.file.Path): String = {
+    val digest = MessageDigest.getInstance("SHA-256")
+    val input = Files.newInputStream(path)
+    val buffer = new Array[Byte](8192)
+    try {
+      var read = input.read(buffer)
+      while (read >= 0) {
+        if (read > 0) {
+          digest.update(buffer, 0, read)
+        }
+        read = input.read(buffer)
+      }
+    } finally {
+      input.close()
+    }
+    digest.digest().map(byte => f"${byte & 0xff}%02x").mkString
+  }
+
+  private def loadUnsafe(sourceDirectory: String,
+                         expectedCount: Int,
+                         expectedAction: C1BackendPressureActionIdentity,
+                         expectedWorkloadId: String): Vector[C1BackendPressurePreparedRequest] = {
+    val source = Paths.get(sourceDirectory)
+    val manifestPath = source.resolve("manifest.json")
+    if (!Files.isRegularFile(manifestPath)) {
+      deserializationError(s"prepared request manifest is not ready: $manifestPath")
+    }
+    val manifest = new String(Files.readAllBytes(manifestPath), StandardCharsets.UTF_8).parseJson.asJsObject.fields
+    if (requiredString(manifest, "schema_version") != schemaVersion) {
+      deserializationError(s"prepared request schema_version must be $schemaVersion")
+    }
+    if (requiredInt(manifest, "configured_request_count") != expectedCount) {
+      deserializationError(s"prepared request count must equal planned_logical_requests=$expectedCount")
+    }
+    if (manifest.get("failure_probability").map(_.convertTo[Double]).getOrElse(-1.0) != 0.0) {
+      deserializationError("prepared request failure_probability must be 0")
+    }
+    val action = requiredObject(manifest, "action").fields
+    if (requiredObject(action, "canonical_fqen") != expectedAction.canonicalFqen) {
+      deserializationError("prepared request canonical_fqen does not match resolved action")
+    }
+    if (requiredString(action, "revision") != expectedAction.revision) {
+      deserializationError("prepared request revision does not match resolved action")
+    }
+    val workload = requiredObject(manifest, "workload").fields
+    if (requiredString(workload, "workload_id") != expectedWorkloadId) {
+      deserializationError(s"prepared request workload_id must be $expectedWorkloadId")
+    }
+
+    val requestsPath = source.resolve(requiredString(manifest, "requests_file"))
+    if (!Files.isRegularFile(requestsPath)) {
+      deserializationError(s"prepared request data is missing: $requestsPath")
+    }
+    val expectedSha256 = requiredString(manifest, "requests_sha256")
+    if (sha256(requestsPath) != expectedSha256) {
+      deserializationError("prepared request data sha256 does not match manifest")
+    }
+
+    val rows = Vector.newBuilder[C1BackendPressurePreparedRequest]
+    val reader = Files.newBufferedReader(requestsPath, StandardCharsets.UTF_8)
+    try {
+      var ordinal = 1
+      var line = reader.readLine()
+      while (line != null) {
+        val fields = line.parseJson.asJsObject.fields
+        val rowOrdinal = requiredInt(fields, "ordinal")
+        val logicalRequestId = requiredString(fields, "logical_request_id")
+        val expectedLogicalRequestId = ordinal.toString
+        if (rowOrdinal != ordinal || logicalRequestId != expectedLogicalRequestId) {
+          deserializationError(s"prepared request row $ordinal is out of order")
+        }
+        val actionParams = requiredObject(fields, "action_params")
+        val actionFields = actionParams.fields
+        if (requiredString(actionFields, "logical_request_id") != logicalRequestId) {
+          deserializationError(s"prepared request row $ordinal action logical_request_id does not match")
+        }
+        if (requiredString(actionFields, "attempt_id") != "1") {
+          deserializationError(s"prepared request row $ordinal attempt_id must be 1")
+        }
+        rows += C1BackendPressurePreparedRequest(
+          ordinal,
+          logicalRequestId,
+          requiredString(fields, "expected_rid"),
+          actionParams)
+        ordinal += 1
+        line = reader.readLine()
+      }
+    } finally {
+      reader.close()
+    }
+    val result = rows.result()
+    if (result.size != expectedCount) {
+      deserializationError(s"prepared request rows=${result.size} must equal planned_logical_requests=$expectedCount")
+    }
+    result
+  }
+
+  def load(sourceDirectory: String,
+           expectedCount: Int,
+           expectedAction: C1BackendPressureActionIdentity,
+           expectedWorkloadId: String): Either[String, Vector[C1BackendPressurePreparedRequest]] =
+    try {
+      Right(loadUnsafe(sourceDirectory, expectedCount, expectedAction, expectedWorkloadId))
+    } catch {
+      case NonFatal(error) => Left(Option(error.getMessage).getOrElse(error.getClass.getSimpleName))
+    }
+}
+
 /** A trait implementing the actions API. */
 trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with ReferencedEntities {
   services: WhiskServices =>
@@ -146,7 +286,8 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                               plateau_no_improve_sec: Option[Int] = None,
                                               plateau_min_improvement_fraction: Option[Double] = None,
                                               scheduler_fallback_retry_enabled: Option[Boolean] = None,
-                                              scheduler_fallback_retry_limit: Option[Int] = None)
+                                              scheduler_fallback_retry_limit: Option[Int] = None,
+                                              prepared_request_source: Option[String] = None)
 
   private implicit object C1BackendPressureRequestFormat extends RootJsonFormat[C1BackendPressureRequest] {
     private def required[T](fields: Map[String, JsValue], name: String)(implicit reader: JsonReader[T]): T =
@@ -190,7 +331,8 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         plateau_no_improve_sec = optional[Int](fields, "plateau_no_improve_sec"),
         plateau_min_improvement_fraction = optional[Double](fields, "plateau_min_improvement_fraction"),
         scheduler_fallback_retry_enabled = optional[Boolean](fields, "scheduler_fallback_retry_enabled"),
-        scheduler_fallback_retry_limit = optional[Int](fields, "scheduler_fallback_retry_limit"))
+        scheduler_fallback_retry_limit = optional[Int](fields, "scheduler_fallback_retry_limit"),
+        prepared_request_source = optional[String](fields, "prepared_request_source"))
     }
 
     override def write(request: C1BackendPressureRequest): JsValue = {
@@ -224,7 +366,8 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         request.plateau_no_improve_sec.map("plateau_no_improve_sec" -> JsNumber(_)),
         request.plateau_min_improvement_fraction.map("plateau_min_improvement_fraction" -> JsNumber(_)),
         request.scheduler_fallback_retry_enabled.map("scheduler_fallback_retry_enabled" -> JsBoolean(_)),
-        request.scheduler_fallback_retry_limit.map("scheduler_fallback_retry_limit" -> JsNumber(_))).flatten.toMap
+        request.scheduler_fallback_retry_limit.map("scheduler_fallback_retry_limit" -> JsNumber(_)),
+        request.prepared_request_source.map("prepared_request_source" -> JsString(_))).flatten.toMap
       JsObject(baseFields ++ optionalFields)
     }
   }
@@ -418,7 +561,21 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       errorIf(
         request.failure_probability < 0.0 || request.failure_probability > 1.0,
         "failure_probability must be between 0.0 and 1.0"),
-      errorIf(request.workload_id.trim.isEmpty, "workload_id is required")).flatten ++ modeErrors.flatten
+      errorIf(request.workload_id.trim.isEmpty, "workload_id is required"),
+      errorIf(
+        request.prepared_request_source.nonEmpty &&
+          !(request.profile == "asyncs" && request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow),
+        "prepared_request_source is only valid for asyncs completion_window"),
+      errorIf(
+        request.profile == "asyncs" &&
+          request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow &&
+          request.prepared_request_source.forall(_.trim.isEmpty),
+        "prepared_request_source is required for asyncs completion_window"),
+      errorIf(
+        request.profile == "asyncs" &&
+          request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow &&
+          request.failure_probability != 0.0,
+        "asyncs completion_window currently requires failure_probability=0")).flatten ++ modeErrors.flatten
 
     if (errors.isEmpty) None else Some(errors.mkString("; "))
   }
@@ -646,6 +803,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                       plannedSubmitMonoNs: Long,
                                       actualSubmitMonoNs: Long,
                                       sourceScheduleLagNs: Long,
+                                      preparedPayload: Option[JsObject] = None,
                                       requireTerminalActivationResult: Boolean = false,
                                       schedulerFallbackRetryLimit: Int = 0)(
     implicit parentTransid: TransactionId): Future[C1BackendPressureOutcome] = {
@@ -668,17 +826,18 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       plannedSubmitMonoNs = plannedSubmitMonoNs,
       actualSubmitMonoNs = actualSubmitMonoNs,
       sourceScheduleLagNs = sourceScheduleLagNs)
+    val payload = preparedPayload.getOrElse(c1BackendPressurePayload(request, scheduleEntry))
 
     val invocation =
       if (requireTerminalActivationResult) {
         invokeBackendPressureBlockingAction(
           user,
           action,
-          Some(c1BackendPressurePayload(request, scheduleEntry)),
+          Some(payload),
           metadata,
           schedulerFallbackRetryLimit)(logicalTransid)
       } else {
-        invokeBackendPressureAction(user, action, Some(c1BackendPressurePayload(request, scheduleEntry)), metadata)(
+        invokeBackendPressureAction(user, action, Some(payload), metadata)(
           logicalTransid)
       }
 
@@ -914,7 +1073,8 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
 
   private def runC1BackendPressureCompletionWindow(user: Identity,
                                                    action: WhiskActionMetaData,
-                                                   request: C1BackendPressureRequest)(
+                                                   request: C1BackendPressureRequest,
+                                                   preparedRequests: Option[Vector[C1BackendPressurePreparedRequest]])(
     implicit transid: TransactionId): Future[Vector[C1BackendPressureOutcome]] = {
     val runStartMonoNs = System.nanoTime()
     val targetLogicalRequests = request.planned_logical_requests
@@ -990,6 +1150,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         actualSubmitMonoNs,
         actualSubmitMonoNs,
         0L,
+        preparedPayload = preparedRequests.map(_(logicalRequestId - 1).actionParams),
         requireTerminalActivationResult = true,
         schedulerFallbackRetryLimit = schedulerFallbackRetryLimit)
     }
@@ -1127,82 +1288,101 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
 
                       onComplete(checks) {
                         case Success(_) =>
-                          val submitted = request.planned_logical_requests
-                          if (
-                            request.request_generation_mode == c1BackendPressureRequestModeRamp ||
-                            request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp ||
-                            request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
-                            val run =
-                              if (request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp) {
-                                runC1BackendPressureStageGatedRamp(user, action, request)
-                              } else if (request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
-                                runC1BackendPressureCompletionWindow(user, action, request)
-                              } else {
-                                runC1BackendPressureOpenLoopRamp(user, action, request)
-                              }
-                            run.onComplete {
-                              case Success(results) =>
-                                val completed = results.count {
-                                  case C1BackendPressureOutcome(_, Right(result), _) => result.completed
-                                  case _                                          => false
-                                }
-                                val failed = results.count {
-                                  case C1BackendPressureOutcome(_, Right(result), _) => result.failed
-                                  case C1BackendPressureOutcome(_, Left(_), _)       => true
-                                }
-                                val notReady = results.count {
-                                  case C1BackendPressureOutcome(_, Right(result), _) => result.notReady
-                                  case _                                          => false
-                                }
-                                val finalSubmitted =
-                                  if (
-                                    request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp ||
-                                    request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
-                                    results.size
+                          val preparedRequestResult =
+                            if (
+                              request.profile == "asyncs" &&
+                              request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
+                              C1BackendPressurePreparedRequests
+                                .load(
+                                  request.prepared_request_source.get,
+                                  request.planned_logical_requests,
+                                  C1BackendPressurePreparedRequests.actionIdentity(action),
+                                  request.workload_id)
+                                .map(requests => Some(requests))
+                            } else {
+                              Right(None)
+                            }
+                          preparedRequestResult match {
+                            case Left(error) =>
+                              terminate(BadRequest, s"prepared request source is invalid: $error")
+                            case Right(preparedRequests) =>
+                              val submitted = request.planned_logical_requests
+                              if (
+                                request.request_generation_mode == c1BackendPressureRequestModeRamp ||
+                                request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp ||
+                                request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
+                                val run =
+                                  if (request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp) {
+                                    runC1BackendPressureStageGatedRamp(user, action, request)
+                                  } else if (request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
+                                    runC1BackendPressureCompletionWindow(user, action, request, preparedRequests)
                                   } else {
-                                    submitted
+                                    runC1BackendPressureOpenLoopRamp(user, action, request)
                                   }
-                                emitC1BackendPressureStatus(request.run_id, finalSubmitted, completed, failed, notReady)
-                              case Failure(_) =>
-                                if (
-                                  request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp ||
-                                  request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
-                                  emitC1BackendPressureRunDecision(request, 0, 0, "aborted", "controller_background_failure")
+                                run.onComplete {
+                                  case Success(results) =>
+                                    val completed = results.count {
+                                      case C1BackendPressureOutcome(_, Right(result), _) => result.completed
+                                      case _                                          => false
+                                    }
+                                    val failed = results.count {
+                                      case C1BackendPressureOutcome(_, Right(result), _) => result.failed
+                                      case C1BackendPressureOutcome(_, Left(_), _)       => true
+                                    }
+                                    val notReady = results.count {
+                                      case C1BackendPressureOutcome(_, Right(result), _) => result.notReady
+                                      case _                                          => false
+                                    }
+                                    val finalSubmitted =
+                                      if (
+                                        request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp ||
+                                        request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
+                                        results.size
+                                      } else {
+                                        submitted
+                                      }
+                                    emitC1BackendPressureStatus(request.run_id, finalSubmitted, completed, failed, notReady)
+                                  case Failure(_) =>
+                                    if (
+                                      request.request_generation_mode == c1BackendPressureRequestModeStageGatedRamp ||
+                                      request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
+                                      emitC1BackendPressureRunDecision(request, 0, 0, "aborted", "controller_background_failure")
+                                    }
+                                    emitC1BackendPressureStatus(request.run_id, submitted, 0, submitted, 0)
                                 }
-                                emitC1BackendPressureStatus(request.run_id, submitted, 0, submitted, 0)
-                            }
-                            complete(Accepted, c1BackendPressureAckResponse(request, submitted))
-                          } else {
-                            val run = runC1BackendPressureOpenLoopRate(user, action, request)
-                            onComplete(run) {
-                              case Success(results) =>
-                                val completed = results.count {
-                                  case C1BackendPressureOutcome(_, Right(result), _) => result.completed
-                                  case _                                          => false
+                                complete(Accepted, c1BackendPressureAckResponse(request, submitted))
+                              } else {
+                                val run = runC1BackendPressureOpenLoopRate(user, action, request)
+                                onComplete(run) {
+                                  case Success(results) =>
+                                    val completed = results.count {
+                                      case C1BackendPressureOutcome(_, Right(result), _) => result.completed
+                                      case _                                          => false
+                                    }
+                                    val failed = results.count {
+                                      case C1BackendPressureOutcome(_, Right(result), _) => result.failed
+                                      case C1BackendPressureOutcome(_, Left(_), _)       => true
+                                    }
+                                    val notReady = results.count {
+                                      case C1BackendPressureOutcome(_, Right(result), _) => result.notReady
+                                      case _                                          => false
+                                    }
+                                    emitC1BackendPressureStatus(request.run_id, submitted, completed, failed, notReady)
+                                    complete(
+                                      OK,
+                                      c1BackendPressureResponse(
+                                        request.run_id,
+                                        request.request_generation_mode,
+                                        submitted,
+                                        completed,
+                                        failed,
+                                        notReady,
+                                        results))
+                                  case Failure(t) =>
+                                    emitC1BackendPressureStatus(request.run_id, submitted, 0, submitted, 0)
+                                    terminate(InternalServerError, t.getMessage)
                                 }
-                                val failed = results.count {
-                                  case C1BackendPressureOutcome(_, Right(result), _) => result.failed
-                                  case C1BackendPressureOutcome(_, Left(_), _)       => true
-                                }
-                                val notReady = results.count {
-                                  case C1BackendPressureOutcome(_, Right(result), _) => result.notReady
-                                  case _                                          => false
-                                }
-                                emitC1BackendPressureStatus(request.run_id, submitted, completed, failed, notReady)
-                                complete(
-                                  OK,
-                                  c1BackendPressureResponse(
-                                    request.run_id,
-                                    request.request_generation_mode,
-                                    submitted,
-                                    completed,
-                                    failed,
-                                    notReady,
-                                    results))
-                              case Failure(t) =>
-                                emitC1BackendPressureStatus(request.run_id, submitted, 0, submitted, 0)
-                                terminate(InternalServerError, t.getMessage)
-                            }
+                              }
                           }
 
                         case Failure(f) =>
