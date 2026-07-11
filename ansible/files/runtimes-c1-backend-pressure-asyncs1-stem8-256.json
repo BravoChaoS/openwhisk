@@ -1,9 +1,26 @@
 {
     "description": [
         "C1 backend-pressure AsynCS managed runtime manifest.",
-        "Use the fixed AsynCS HW runtime image with eight 256 MB stem cells per invoker."
+        "Use the fixed AsynCS HW runtime image with eight 256 MB stem cells per invoker.",
+        "Retain nodejs:20 without stem cells for the OpenWhisk invoker health action."
     ],
     "runtimes": {
+        "nodejs": [
+            {
+                "kind": "nodejs:20",
+                "default": true,
+                "image": {
+                    "prefix": "openwhisk",
+                    "name": "action-nodejs-v20",
+                    "tag": "nightly"
+                },
+                "deprecated": false,
+                "attached": {
+                    "attachmentName": "codefile",
+                    "attachmentType": "text/plain"
+                }
+            }
+        ],
         "asyncs": [
             {
                 "kind": "asyncs:1",
