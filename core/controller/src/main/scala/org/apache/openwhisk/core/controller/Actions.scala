@@ -1256,25 +1256,43 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             case Right(result) => result.completed || result.failed
             case Left(_)       => false
           }
-          val newPlateauState =
+          val evaluatedPlateauState =
             if (terminalResult) updatePlateauState(plateauState, completionTimesNs, completionElapsedNs) else plateauState
-          val plateauStop = terminalResult && newPlateauState.stop
+          val plateauStopNow = terminalResult && evaluatedPlateauState.stop
           val targetReached = nextLogicalRequestId > targetLogicalRequests
-          val (newNextLogicalRequestId, nextInFlight, refillLogicalRequestId) =
-            if (terminalResult && !plateauStop && nextLogicalRequestId <= targetLogicalRequests) {
-              val refill = launch(nextLogicalRequestId)
-              (nextLogicalRequestId + 1, remaining :+ refill, Some(nextLogicalRequestId))
+          val terminalTransition =
+            if (terminalResult) {
+              Some(
+                C1BackendPressureCompletionWindowTransitions.afterTerminalCompletion(
+                  nextLogicalRequestId,
+                  remaining.size,
+                  targetLogicalRequests,
+                  plateauStopNow,
+                  stopDecision.exists(_._3.stop)))
             } else {
-              (nextLogicalRequestId, if (terminalResult) remaining else Vector.empty, None)
+              None
             }
-          val newStopDecision =
-            if (plateauStop) {
+          val newNextLogicalRequestId = terminalTransition.map(_.nextLogicalRequestId).getOrElse(nextLogicalRequestId)
+          val refillLogicalRequestId = terminalTransition.flatMap(_.refillLogicalRequestId)
+          val nextInFlight =
+            refillLogicalRequestId.map(logicalRequestId => remaining :+ launch(logicalRequestId)).getOrElse {
+              if (terminalResult) remaining else Vector.empty
+            }
+          val stopLatched = terminalTransition.exists(_.stopLatched)
+          val latchedStopReason =
+            stopDecision.map(_._3.stopReason).filter(_.nonEmpty).getOrElse(evaluatedPlateauState.stopReason)
+          val newPlateauState =
+            if (stopLatched) evaluatedPlateauState.copy(stop = true, stopReason = latchedStopReason)
+            else evaluatedPlateauState
+          val newStopDecision = stopDecision.orElse {
+            if (plateauStopNow) {
               Some(("complete", "completion_window_plateau_stop", newPlateauState, completedSoFar, completionElapsedNs))
             } else if (terminalResult && targetReached && nextInFlight.isEmpty) {
               Some(("complete", "completion_window_target_complete", newPlateauState, completedSoFar, completionElapsedNs))
             } else {
-              stopDecision
+              None
             }
+          }
           emitC1BackendPressureWindowEvent(
             request,
             outcome.logicalRequestId,
@@ -1286,14 +1304,14 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             completionElapsedNs = if (terminalResult) Some(completionElapsedNs) else None,
             rollingQps = if (newPlateauState.currentRollingQps > 0.0) Some(newPlateauState.currentRollingQps) else None,
             rollingWindowSize = if (newPlateauState.rollingWindowSize > 0) Some(newPlateauState.rollingWindowSize) else None,
-            plateauDecision = if (plateauStop) Some("stop") else if (plateauEnabled) Some("continue") else None)
+            plateauDecision = if (stopLatched) Some("stop") else if (plateauEnabled) Some("continue") else None)
           if (terminalResult) {
             loop(
               newNextLogicalRequestId,
               nextInFlight,
               accumulated :+ outcome,
               completionTimesNs :+ completionElapsedNs,
-              newPlateauState.copy(stop = false, stopReason = ""),
+              newPlateauState,
               newStopDecision)
           } else {
             val reason = outcome.result match {
