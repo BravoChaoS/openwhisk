@@ -1,0 +1,28 @@
+{
+    "description": [
+        "C1 backend-pressure AsynCS managed runtime manifest.",
+        "Use the fixed AsynCS HW runtime image with eight 256 MB stem cells per invoker."
+    ],
+    "runtimes": {
+        "asyncs": [
+            {
+                "kind": "asyncs:1",
+                "default": true,
+                "image": {
+                    "registry": "172.18.89.214:5000",
+                    "prefix": "acsc",
+                    "name": "openwhisk-runtime",
+                    "tag": "e3-hw-20260614"
+                },
+                "deprecated": false,
+                "stemCells": [
+                    {
+                        "count": 8,
+                        "memory": "256 MB"
+                    }
+                ]
+            }
+        ]
+    },
+    "blackboxes": []
+}
