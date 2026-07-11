@@ -1455,7 +1455,16 @@ object FunctionPullingContainerProxy {
     "cfunc_decrypt_executed",
     "function_cache_bytes",
     "payload_bytes_consumed",
-    "payload_sha256")
+    "payload_sha256",
+    "workload_timing_schema",
+    "workload_core_cycles",
+    "output_kem_cycles",
+    "output_aes_gcm_cycles",
+    "tsc_hz",
+    "tsc_frequency_method",
+    "workload_core_duration_ns",
+    "output_kem_duration_ns",
+    "output_aes_gcm_duration_ns")
 
   private def c1EvidenceValue(value: JsValue): Option[String] = value match {
     case JsString(content) => Some(content)

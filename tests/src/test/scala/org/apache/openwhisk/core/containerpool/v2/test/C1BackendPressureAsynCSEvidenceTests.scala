@@ -57,7 +57,15 @@ class C1BackendPressureAsynCSEvidenceTests extends AnyFlatSpec with Matchers {
         "cfunc_decrypt_executed" -> JsBoolean(false),
         "payload_bytes_consumed" -> JsNumber(1024),
         "payload_sha256" -> JsString("payload-sha256"),
-        "workload_duration_ns" -> JsNumber(999),
+        "workload_timing_schema" -> JsString("enclave-rdtsc-v1"),
+        "workload_core_cycles" -> JsNumber(12000),
+        "output_kem_cycles" -> JsNumber(3000),
+        "output_aes_gcm_cycles" -> JsNumber(900),
+        "tsc_hz" -> JsNumber(2400000000L),
+        "tsc_frequency_method" -> JsString("cpuid_0x15_crystal"),
+        "workload_core_duration_ns" -> JsNumber(5000),
+        "output_kem_duration_ns" -> JsNumber(1250),
+        "output_aes_gcm_duration_ns" -> JsNumber(375),
         "producer_timing_events" -> JsArray(
           producerEvent("A200", "adapter_worker_invoke_enter", JsNumber(1000), JsNumber(100)),
           producerEvent("A210", "adapter_worker_invoke_exit", JsNumber(2000), JsNumber(200)),
@@ -79,6 +87,15 @@ class C1BackendPressureAsynCSEvidenceTests extends AnyFlatSpec with Matchers {
     lines.head should include("function_cache_hit=true")
     lines.head should include("cfunc_decrypt_executed=false")
     lines.head should include("payload_bytes_consumed=1024")
+    lines.head should include("workload_timing_schema=enclave-rdtsc-v1")
+    lines.head should include("workload_core_cycles=12000")
+    lines.head should include("output_kem_cycles=3000")
+    lines.head should include("output_aes_gcm_cycles=900")
+    lines.head should include("tsc_hz=2400000000")
+    lines.head should include("tsc_frequency_method=cpuid_0x15_crystal")
+    lines.head should include("workload_core_duration_ns=5000")
+    lines.head should include("output_kem_duration_ns=1250")
+    lines.head should include("output_aes_gcm_duration_ns=375")
     lines.tail.map(_.split("event_code=")(1).takeWhile(_ != '|')) shouldBe Seq("A200", "A210", "A400", "A410")
     lines.tail.foreach { line =>
       line should startWith("C1TIMING_EVENT|")
@@ -91,7 +108,7 @@ class C1BackendPressureAsynCSEvidenceTests extends AnyFlatSpec with Matchers {
     lines.mkString("\n") should not include "A310"
     lines.mkString("\n") should not include "A320"
     lines.mkString("\n") should not include "A350"
-    lines.mkString("\n") should not include "workload_duration_ns"
+    lines.mkString("\n") should not include "C_out=must-not-be-logged"
     lines.mkString("\n") should not include "must-not-be-logged"
     FunctionPullingContainerProxy
       .c1BackendPressureAsynCSEvidenceLines(
