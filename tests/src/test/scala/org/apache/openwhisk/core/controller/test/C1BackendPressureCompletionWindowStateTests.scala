@@ -22,12 +22,153 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.junit.JUnitRunner
 
+import org.apache.openwhisk.core.controller.C1BackendPressurePlateauState
 import org.apache.openwhisk.core.controller.C1BackendPressureCompletionWindowTransitions
 
 @RunWith(classOf[JUnitRunner])
 class C1BackendPressureCompletionWindowStateTests extends AnyFlatSpec with Matchers {
 
+  private val plateauWindowSize = 200
+  private val warmupCompletions = 1000
+  private val warmupNs = 10L * 1000000000L
+  private val noImproveNs = 10L * 1000000000L
+  private val minImprovementFraction = 0.03
+
+  private def completionHistory(completionCount: Int,
+                                completionElapsedNs: Long,
+                                rollingQps: Double): Vector[Long] = {
+    val priorCompletionCount = completionCount - 1
+    val windowStartIndex = priorCompletionCount - plateauWindowSize
+    val windowElapsedNs = math.round(plateauWindowSize.toDouble * 1000000000.0 / rollingQps)
+    val windowStartNs = completionElapsedNs - windowElapsedNs
+    Vector.tabulate(priorCompletionCount) { index =>
+      if (index <= windowStartIndex) {
+        windowStartNs - (windowStartIndex - index).toLong
+      } else {
+        windowStartNs + (completionElapsedNs - windowStartNs) * (index - windowStartIndex) / plateauWindowSize
+      }
+    }
+  }
+
+  private def evaluate(previous: C1BackendPressurePlateauState,
+                       completionCount: Int,
+                       completionElapsedNs: Long,
+                       rollingQps: Double,
+                       plateauEnabled: Boolean = true): C1BackendPressurePlateauState =
+    C1BackendPressureCompletionWindowTransitions.evaluatePlateauCompletion(
+      previous = previous,
+      completionTimesNs = completionHistory(completionCount, completionElapsedNs, rollingQps),
+      completionElapsedNs = completionElapsedNs,
+      plateauEnabled = plateauEnabled,
+      plateauWindowSize = plateauWindowSize,
+      plateauWarmupCompletions = warmupCompletions,
+      plateauWarmupNs = warmupNs,
+      plateauNoImproveNs = noImproveNs,
+      plateauMinImprovementFraction = minImprovementFraction)
+
   behavior of "C1 backend-pressure completion-window transitions"
+
+  it should "start the no-improve clock only after both warmup gates" in {
+    val initial = C1BackendPressurePlateauState(rollingWindowSize = plateauWindowSize)
+
+    val completion598 = evaluate(
+      initial,
+      completionCount = 598,
+      completionElapsedNs = 25202126731L,
+      rollingQps = 45.135058553078444)
+    completion598.currentRollingQps should be > 0.0
+    completion598.bestRollingQps shouldBe 0.0
+    completion598.bestCompletionElapsedNs shouldBe 0L
+    completion598.stop shouldBe false
+
+    val countWarmButTimeCold = evaluate(
+      completion598,
+      completionCount = 1000,
+      completionElapsedNs = warmupNs - 1L,
+      rollingQps = 45.0)
+    countWarmButTimeCold.bestRollingQps shouldBe 0.0
+    countWarmButTimeCold.bestCompletionElapsedNs shouldBe 0L
+    countWarmButTimeCold.stop shouldBe false
+
+    val completion1000 = evaluate(
+      countWarmButTimeCold,
+      completionCount = 1000,
+      completionElapsedNs = 34386441082L,
+      rollingQps = 45.002280239663435)
+    completion1000.bestRollingQps should be > 45.0
+    completion1000.bestCompletionElapsedNs shouldBe 34386441082L
+    completion1000.stop shouldBe false
+
+    val completion1030 = evaluate(
+      completion1000,
+      completionCount = 1030,
+      completionElapsedNs = 35205674761L,
+      rollingQps = 43.49792944179377)
+    completion1030.bestCompletionElapsedNs shouldBe 34386441082L
+    completion1030.stop shouldBe false
+
+    val justBeforeFullInterval = evaluate(
+      completion1030,
+      completionCount = 1200,
+      completionElapsedNs = 44386441081L,
+      rollingQps = 43.0)
+    justBeforeFullInterval.stop shouldBe false
+
+    val fullInterval = evaluate(
+      justBeforeFullInterval,
+      completionCount = 1201,
+      completionElapsedNs = 44386441082L,
+      rollingQps = 43.0)
+    fullInterval.stop shouldBe true
+    fullInterval.stopReason shouldBe "plateau_no_improvement"
+  }
+
+  it should "reset the no-improve clock after a qualifying improvement" in {
+    val baseline = evaluate(
+      C1BackendPressurePlateauState(rollingWindowSize = plateauWindowSize),
+      completionCount = 1000,
+      completionElapsedNs = 34386441082L,
+      rollingQps = 45.0)
+
+    val improved = evaluate(
+      baseline,
+      completionCount = 1100,
+      completionElapsedNs = 40000000000L,
+      rollingQps = 47.0)
+    improved.bestRollingQps should be > 46.9
+    improved.bestCompletionElapsedNs shouldBe 40000000000L
+    improved.stop shouldBe false
+
+    val beforeResetInterval = evaluate(
+      improved,
+      completionCount = 1300,
+      completionElapsedNs = 49999999999L,
+      rollingQps = 46.0)
+    beforeResetInterval.stop shouldBe false
+
+    val afterResetInterval = evaluate(
+      beforeResetInterval,
+      completionCount = 1301,
+      completionElapsedNs = 50000000000L,
+      rollingQps = 46.0)
+    afterResetInterval.stop shouldBe true
+    afterResetInterval.bestCompletionElapsedNs shouldBe 40000000000L
+  }
+
+  it should "preserve plateau-disabled behavior" in {
+    val previous = C1BackendPressurePlateauState(
+      bestRollingQps = 12.0,
+      bestCompletionElapsedNs = 7L,
+      currentRollingQps = 11.0,
+      rollingWindowSize = 17)
+
+    evaluate(
+      previous,
+      completionCount = 1000,
+      completionElapsedNs = 34386441082L,
+      rollingQps = 45.0,
+      plateauEnabled = false) shouldBe previous.copy(rollingWindowSize = plateauWindowSize)
+  }
 
   it should "latch the first plateau stop while draining later completions" in {
     val targetLogicalRequests = 100000

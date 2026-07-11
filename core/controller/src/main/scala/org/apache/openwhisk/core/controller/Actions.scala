@@ -403,13 +403,6 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                               result: Either[String, BackendPressureActivationResult],
                                               sourceScheduleLagNs: Long)
 
-  private case class C1BackendPressurePlateauState(bestRollingQps: Double = 0.0,
-                                                   bestCompletionElapsedNs: Long = 0L,
-                                                   currentRollingQps: Double = 0.0,
-                                                   rollingWindowSize: Int = 0,
-                                                   stop: Boolean = false,
-                                                   stopReason: String = "")
-
   private case class C1BackendPressureScheduleEntry(logicalRequestId: Int,
                                                     plannedSubmitOffsetNs: Long,
                                                     rampStageIndex: Option[Int] = None,
@@ -1161,35 +1154,6 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         "scheduler_fallback_retry_enabled" -> schedulerFallbackRetryEnabled.toString,
         "scheduler_fallback_retry_limit" -> schedulerFallbackRetryLimit.toString)
 
-    def updatePlateauState(previous: C1BackendPressurePlateauState,
-                           completionTimesNs: Vector[Long],
-                           completionElapsedNs: Long): C1BackendPressurePlateauState = {
-      if (!plateauEnabled || plateauWindowSize <= 0 || completionTimesNs.size < plateauWindowSize) {
-        previous.copy(rollingWindowSize = plateauWindowSize)
-      } else {
-        val windowStartNs = completionTimesNs(completionTimesNs.size - plateauWindowSize)
-        val windowElapsedNs = math.max(1L, completionElapsedNs - windowStartNs)
-        val rollingQps = plateauWindowSize.toDouble * 1000000000.0 / windowElapsedNs.toDouble
-        val improvementThreshold = previous.bestRollingQps * (1.0 + plateauMinImprovementFraction)
-        val warmupDone = completionTimesNs.size + 1 >= plateauWarmupCompletions && completionElapsedNs >= plateauWarmupNs
-        if (previous.bestRollingQps <= 0.0 || rollingQps > improvementThreshold) {
-          C1BackendPressurePlateauState(
-            bestRollingQps = rollingQps,
-            bestCompletionElapsedNs = completionElapsedNs,
-            currentRollingQps = rollingQps,
-            rollingWindowSize = plateauWindowSize)
-        } else if (warmupDone && completionElapsedNs - previous.bestCompletionElapsedNs > plateauNoImproveNs) {
-          previous.copy(
-            currentRollingQps = rollingQps,
-            rollingWindowSize = plateauWindowSize,
-            stop = true,
-            stopReason = "plateau_no_improvement")
-        } else {
-          previous.copy(currentRollingQps = rollingQps, rollingWindowSize = plateauWindowSize)
-        }
-      }
-    }
-
     def launch(logicalRequestId: Int): (Int, Future[C1BackendPressureOutcome]) = {
       val actualSubmitMonoNs = System.nanoTime()
       val plannedSubmitOffsetNs = math.max(0L, actualSubmitMonoNs - runStartMonoNs)
@@ -1257,7 +1221,20 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
             case Left(_)       => false
           }
           val evaluatedPlateauState =
-            if (terminalResult) updatePlateauState(plateauState, completionTimesNs, completionElapsedNs) else plateauState
+            if (terminalResult) {
+              C1BackendPressureCompletionWindowTransitions.evaluatePlateauCompletion(
+                previous = plateauState,
+                completionTimesNs = completionTimesNs,
+                completionElapsedNs = completionElapsedNs,
+                plateauEnabled = plateauEnabled,
+                plateauWindowSize = plateauWindowSize,
+                plateauWarmupCompletions = plateauWarmupCompletions,
+                plateauWarmupNs = plateauWarmupNs,
+                plateauNoImproveNs = plateauNoImproveNs,
+                plateauMinImprovementFraction = plateauMinImprovementFraction)
+            } else {
+              plateauState
+            }
           val plateauStopNow = terminalResult && evaluatedPlateauState.stop
           val targetReached = nextLogicalRequestId > targetLogicalRequests
           val terminalTransition =

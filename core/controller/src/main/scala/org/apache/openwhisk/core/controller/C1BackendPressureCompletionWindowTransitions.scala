@@ -23,7 +23,55 @@ private[controller] final case class C1BackendPressureCompletionWindowTransition
   refillLogicalRequestId: Option[Int],
   stopLatched: Boolean)
 
+private[controller] final case class C1BackendPressurePlateauState(bestRollingQps: Double = 0.0,
+                                                                   bestCompletionElapsedNs: Long = 0L,
+                                                                   currentRollingQps: Double = 0.0,
+                                                                   rollingWindowSize: Int = 0,
+                                                                   stop: Boolean = false,
+                                                                   stopReason: String = "")
+
 private[controller] object C1BackendPressureCompletionWindowTransitions {
+  def evaluatePlateauCompletion(previous: C1BackendPressurePlateauState,
+                                completionTimesNs: Vector[Long],
+                                completionElapsedNs: Long,
+                                plateauEnabled: Boolean,
+                                plateauWindowSize: Int,
+                                plateauWarmupCompletions: Int,
+                                plateauWarmupNs: Long,
+                                plateauNoImproveNs: Long,
+                                plateauMinImprovementFraction: Double): C1BackendPressurePlateauState = {
+    if (!plateauEnabled || plateauWindowSize <= 0 || completionTimesNs.size < plateauWindowSize) {
+      previous.copy(rollingWindowSize = plateauWindowSize)
+    } else {
+      val windowStartNs = completionTimesNs(completionTimesNs.size - plateauWindowSize)
+      val windowElapsedNs = math.max(1L, completionElapsedNs - windowStartNs)
+      val rollingQps = plateauWindowSize.toDouble * 1000000000.0 / windowElapsedNs.toDouble
+      val reportingState = previous.copy(currentRollingQps = rollingQps, rollingWindowSize = plateauWindowSize)
+      val warmupDone =
+        completionTimesNs.size + 1 >= plateauWarmupCompletions && completionElapsedNs >= plateauWarmupNs
+
+      if (!warmupDone) {
+        reportingState
+      } else if (previous.bestRollingQps <= 0.0) {
+        C1BackendPressurePlateauState(
+          bestRollingQps = rollingQps,
+          bestCompletionElapsedNs = completionElapsedNs,
+          currentRollingQps = rollingQps,
+          rollingWindowSize = plateauWindowSize)
+      } else if (rollingQps > previous.bestRollingQps * (1.0 + plateauMinImprovementFraction)) {
+        C1BackendPressurePlateauState(
+          bestRollingQps = rollingQps,
+          bestCompletionElapsedNs = completionElapsedNs,
+          currentRollingQps = rollingQps,
+          rollingWindowSize = plateauWindowSize)
+      } else if (completionElapsedNs - previous.bestCompletionElapsedNs >= plateauNoImproveNs) {
+        reportingState.copy(stop = true, stopReason = "plateau_no_improvement")
+      } else {
+        reportingState
+      }
+    }
+  }
+
   def afterTerminalCompletion(nextLogicalRequestId: Int,
                               remainingInFlight: Int,
                               targetLogicalRequests: Int,
