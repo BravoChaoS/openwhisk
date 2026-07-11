@@ -17,11 +17,21 @@
 
 package org.apache.openwhisk.core.controller
 
+import scala.concurrent.{ExecutionContext, Future}
+
 private[controller] final case class C1BackendPressureCompletionWindowTransition(
   nextLogicalRequestId: Int,
   inFlightAfterCompletion: Int,
   refillLogicalRequestId: Option[Int],
   stopLatched: Boolean)
+
+private[controller] sealed trait C1BackendPressureCompletionWindowWaitResult[+T]
+
+private[controller] final case class C1BackendPressureCompletionBeforeDeadline[T](value: T, observedMonoNs: Long)
+    extends C1BackendPressureCompletionWindowWaitResult[T]
+
+private[controller] final case class C1BackendPressureCompletionWindowDeadlineReached(observedMonoNs: Long)
+    extends C1BackendPressureCompletionWindowWaitResult[Nothing]
 
 private[controller] final case class C1BackendPressurePlateauState(bestRollingQps: Double = 0.0,
                                                                    bestCompletionElapsedNs: Long = 0L,
@@ -31,6 +41,33 @@ private[controller] final case class C1BackendPressurePlateauState(bestRollingQp
                                                                    stopReason: String = "")
 
 private[controller] object C1BackendPressureCompletionWindowTransitions {
+  def completionWindowDeadlineMonoNs(runStartMonoNs: Long, timeoutSec: Int): Long =
+    runStartMonoNs + timeoutSec.toLong * 1000000000L
+
+  def deadlineReached(deadlineMonoNs: Long, observedMonoNs: Long): Boolean = observedMonoNs >= deadlineMonoNs
+
+  def remainingDeadlineNs(deadlineMonoNs: Long, observedMonoNs: Long): Long =
+    math.max(0L, deadlineMonoNs - observedMonoNs)
+
+  def firstCompletionOrDeadline[T](completion: Future[T],
+                                   deadline: Future[Unit],
+                                   deadlineMonoNs: Long,
+                                   nowMonoNs: () => Long)(
+    implicit executionContext: ExecutionContext): Future[C1BackendPressureCompletionWindowWaitResult[T]] = {
+    val completionResult: Future[C1BackendPressureCompletionWindowWaitResult[T]] = completion.map { value =>
+      val observedMonoNs = nowMonoNs()
+      if (deadlineReached(deadlineMonoNs, observedMonoNs)) {
+        C1BackendPressureCompletionWindowDeadlineReached(observedMonoNs)
+      } else {
+        C1BackendPressureCompletionBeforeDeadline(value, observedMonoNs)
+      }
+    }
+    val deadlineResult: Future[C1BackendPressureCompletionWindowWaitResult[T]] = deadline.map { _ =>
+      C1BackendPressureCompletionWindowDeadlineReached(math.max(deadlineMonoNs, nowMonoNs()))
+    }
+    Future.firstCompletedOf(Seq(completionResult, deadlineResult))
+  }
+
   def evaluatePlateauCompletion(previous: C1BackendPressurePlateauState,
                                 completionTimesNs: Vector[Long],
                                 completionElapsedNs: Long,
@@ -76,9 +113,10 @@ private[controller] object C1BackendPressureCompletionWindowTransitions {
                               remainingInFlight: Int,
                               targetLogicalRequests: Int,
                               plateauStopNow: Boolean,
-                              stopAlreadyLatched: Boolean): C1BackendPressureCompletionWindowTransition = {
+                              stopAlreadyLatched: Boolean,
+                              refillAllowed: Boolean = true): C1BackendPressureCompletionWindowTransition = {
     val stopLatched = stopAlreadyLatched || plateauStopNow
-    if (!stopLatched && nextLogicalRequestId <= targetLogicalRequests) {
+    if (!stopLatched && refillAllowed && nextLogicalRequestId <= targetLogicalRequests) {
       C1BackendPressureCompletionWindowTransition(
         nextLogicalRequestId = nextLogicalRequestId + 1,
         inFlightAfterCompletion = remainingInFlight + 1,

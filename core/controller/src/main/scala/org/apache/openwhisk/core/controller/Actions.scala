@@ -1126,6 +1126,15 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
     val runStartMonoNs = System.nanoTime()
     val targetLogicalRequests = request.planned_logical_requests
     val windowSize = math.min(request.completion_window_size.getOrElse(1), targetLogicalRequests)
+    val completionWindowTimeoutSec = request.completion_window_timeout_sec.get
+    val deadlineMonoNs = C1BackendPressureCompletionWindowTransitions.completionWindowDeadlineMonoNs(
+      runStartMonoNs,
+      completionWindowTimeoutSec)
+    val deadlineDelayNs = C1BackendPressureCompletionWindowTransitions.remainingDeadlineNs(
+      deadlineMonoNs,
+      System.nanoTime())
+    val deadlineSignal =
+      org.apache.pekko.pattern.after(deadlineDelayNs.nanos, actorSystem.scheduler)(Future.successful(()))
     val plateauEnabled = request.plateau_policy_enabled.getOrElse(false)
     val plateauWindowSize = math.min(request.plateau_window_size.getOrElse(windowSize), targetLogicalRequests)
     val plateauWarmupCompletions = request.plateau_warmup_completions.getOrElse(1000)
@@ -1154,8 +1163,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         "scheduler_fallback_retry_enabled" -> schedulerFallbackRetryEnabled.toString,
         "scheduler_fallback_retry_limit" -> schedulerFallbackRetryLimit.toString)
 
-    def launch(logicalRequestId: Int): (Int, Future[C1BackendPressureOutcome]) = {
-      val actualSubmitMonoNs = System.nanoTime()
+    def launch(logicalRequestId: Int, actualSubmitMonoNs: Long): (Int, Future[C1BackendPressureOutcome]) = {
       val plannedSubmitOffsetNs = math.max(0L, actualSubmitMonoNs - runStartMonoNs)
       val scheduleEntry = C1BackendPressureScheduleEntry(
         logicalRequestId = logicalRequestId,
@@ -1178,6 +1186,33 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         preparedPayload = preparedRequests.map(_(logicalRequestId - 1).actionParams),
         requireTerminalActivationResult = true,
         schedulerFallbackRetryLimit = schedulerFallbackRetryLimit)
+    }
+
+    def timeoutRunResult(nextLogicalRequestId: Int,
+                         inFlight: Vector[(Int, Future[C1BackendPressureOutcome])],
+                         accumulated: Vector[C1BackendPressureOutcome],
+                         plateauState: C1BackendPressurePlateauState,
+                         observedMonoNs: Long): Future[Vector[C1BackendPressureOutcome]] = {
+      val observedElapsedNs = math.max(0L, observedMonoNs - runStartMonoNs)
+      emitC1BackendPressureRunDecision(
+        request,
+        nextLogicalRequestId - 1,
+        0,
+        "timeout",
+        "completion_window_timeout",
+        plateauRunDecisionFields(plateauState, accumulated.size, observedElapsedNs) ++ Seq(
+          "completion_window_timeout_sec" -> completionWindowTimeoutSec.toString,
+          "completion_window_deadline_elapsed_ns" -> (deadlineMonoNs - runStartMonoNs).toString,
+          "completion_window_timeout_observed_elapsed_ns" -> observedElapsedNs.toString,
+          "completion_window_completed_at_timeout" -> accumulated.size.toString,
+          "completion_window_inflight_at_timeout" -> inFlight.size.toString,
+          "completion_window_timeout_classification" -> "invalid",
+          "completion_window_inflight_disposition" -> "not_cancelled_no_refill"))
+      val timedOutInFlight = inFlight.map {
+        case (logicalRequestId, _) =>
+          C1BackendPressureOutcome(logicalRequestId.toString, Left("completion_window_timeout_inflight"), 0L)
+      }
+      Future.successful(accumulated ++ timedOutInFlight)
     }
 
     def loop(nextLogicalRequestId: Int,
@@ -1210,106 +1245,156 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         }
         Future.successful(accumulated)
       } else {
-        Future.firstCompletedOf(inFlight.map(_._2)).flatMap { outcome =>
-          val completionElapsedNs = math.max(0L, System.nanoTime() - runStartMonoNs)
-          val remaining = inFlight.filterNot { case (logicalRequestId, _) =>
-            logicalRequestId.toString == outcome.logicalRequestId
+        C1BackendPressureCompletionWindowTransitions
+          .firstCompletionOrDeadline(
+            Future.firstCompletedOf(inFlight.map(_._2)),
+            deadlineSignal,
+            deadlineMonoNs,
+            () => System.nanoTime())
+          .flatMap {
+            case C1BackendPressureCompletionWindowDeadlineReached(observedMonoNs) =>
+              timeoutRunResult(nextLogicalRequestId, inFlight, accumulated, plateauState, observedMonoNs)
+            case C1BackendPressureCompletionBeforeDeadline(outcome, completionMonoNs) =>
+              val completionElapsedNs = math.max(0L, completionMonoNs - runStartMonoNs)
+              val remaining = inFlight.filterNot { case (logicalRequestId, _) =>
+                logicalRequestId.toString == outcome.logicalRequestId
+              }
+              val completedSoFar = accumulated.size + 1
+              val terminalResult = outcome.result match {
+                case Right(result) => result.completed || result.failed
+                case Left(_)       => false
+              }
+              val evaluatedPlateauState =
+                if (terminalResult) {
+                  C1BackendPressureCompletionWindowTransitions.evaluatePlateauCompletion(
+                    previous = plateauState,
+                    completionTimesNs = completionTimesNs,
+                    completionElapsedNs = completionElapsedNs,
+                    plateauEnabled = plateauEnabled,
+                    plateauWindowSize = plateauWindowSize,
+                    plateauWarmupCompletions = plateauWarmupCompletions,
+                    plateauWarmupNs = plateauWarmupNs,
+                    plateauNoImproveNs = plateauNoImproveNs,
+                    plateauMinImprovementFraction = plateauMinImprovementFraction)
+                } else {
+                  plateauState
+                }
+              val plateauStopNow = terminalResult && evaluatedPlateauState.stop
+              val targetReached = nextLogicalRequestId > targetLogicalRequests
+              val refillSubmitMonoNs = System.nanoTime()
+              val deadlineReachedBeforeRefill = C1BackendPressureCompletionWindowTransitions.deadlineReached(
+                deadlineMonoNs,
+                refillSubmitMonoNs)
+              val terminalTransition =
+                if (terminalResult) {
+                  Some(
+                    C1BackendPressureCompletionWindowTransitions.afterTerminalCompletion(
+                      nextLogicalRequestId,
+                      remaining.size,
+                      targetLogicalRequests,
+                      plateauStopNow,
+                      stopDecision.exists(_._3.stop),
+                      refillAllowed = !deadlineReachedBeforeRefill))
+                } else {
+                  None
+                }
+              val newNextLogicalRequestId =
+                terminalTransition.map(_.nextLogicalRequestId).getOrElse(nextLogicalRequestId)
+              val refillLogicalRequestId = terminalTransition.flatMap(_.refillLogicalRequestId)
+              val nextInFlight =
+                refillLogicalRequestId
+                  .map(logicalRequestId => remaining :+ launch(logicalRequestId, refillSubmitMonoNs))
+                  .getOrElse {
+                    if (terminalResult) remaining else Vector.empty
+                  }
+              val stopLatched = terminalTransition.exists(_.stopLatched)
+              val latchedStopReason =
+                stopDecision.map(_._3.stopReason).filter(_.nonEmpty).getOrElse(evaluatedPlateauState.stopReason)
+              val newPlateauState =
+                if (stopLatched) evaluatedPlateauState.copy(stop = true, stopReason = latchedStopReason)
+                else evaluatedPlateauState
+              val newStopDecision = stopDecision.orElse {
+                if (plateauStopNow) {
+                  Some(
+                    ("complete", "completion_window_plateau_stop", newPlateauState, completedSoFar, completionElapsedNs))
+                } else if (terminalResult && targetReached && nextInFlight.isEmpty) {
+                  Some(
+                    ("complete", "completion_window_target_complete", newPlateauState, completedSoFar, completionElapsedNs))
+                } else {
+                  None
+                }
+              }
+              emitC1BackendPressureWindowEvent(
+                request,
+                outcome.logicalRequestId,
+                submittedSoFar = newNextLogicalRequestId - 1,
+                completedSoFar = completedSoFar,
+                inFlightAfterCompletion = nextInFlight.size,
+                nextLogicalRequestId = refillLogicalRequestId,
+                outcome = outcome,
+                completionElapsedNs = if (terminalResult) Some(completionElapsedNs) else None,
+                rollingQps =
+                  if (newPlateauState.currentRollingQps > 0.0) Some(newPlateauState.currentRollingQps) else None,
+                rollingWindowSize =
+                  if (newPlateauState.rollingWindowSize > 0) Some(newPlateauState.rollingWindowSize) else None,
+                plateauDecision = if (stopLatched) Some("stop") else if (plateauEnabled) Some("continue") else None)
+              if (terminalResult) {
+                val newAccumulated = accumulated :+ outcome
+                val newCompletionTimesNs = completionTimesNs :+ completionElapsedNs
+                if (deadlineReachedBeforeRefill) {
+                  timeoutRunResult(
+                    newNextLogicalRequestId,
+                    nextInFlight,
+                    newAccumulated,
+                    newPlateauState,
+                    refillSubmitMonoNs)
+                } else {
+                  loop(
+                    newNextLogicalRequestId,
+                    nextInFlight,
+                    newAccumulated,
+                    newCompletionTimesNs,
+                    newPlateauState,
+                    newStopDecision)
+                }
+              } else {
+                val reason = outcome.result match {
+                  case Right(result) => result.reason
+                  case Left(error)   => error
+                }
+                emitC1BackendPressureRunDecision(
+                  request,
+                  newNextLogicalRequestId - 1,
+                  0,
+                  "invalid_non_terminal_completion_signal",
+                  reason,
+                  plateauRunDecisionFields(newPlateauState, completedSoFar, completionElapsedNs))
+                Future.successful(accumulated :+ outcome)
+              }
           }
-          val completedSoFar = accumulated.size + 1
-          val terminalResult = outcome.result match {
-            case Right(result) => result.completed || result.failed
-            case Left(_)       => false
-          }
-          val evaluatedPlateauState =
-            if (terminalResult) {
-              C1BackendPressureCompletionWindowTransitions.evaluatePlateauCompletion(
-                previous = plateauState,
-                completionTimesNs = completionTimesNs,
-                completionElapsedNs = completionElapsedNs,
-                plateauEnabled = plateauEnabled,
-                plateauWindowSize = plateauWindowSize,
-                plateauWarmupCompletions = plateauWarmupCompletions,
-                plateauWarmupNs = plateauWarmupNs,
-                plateauNoImproveNs = plateauNoImproveNs,
-                plateauMinImprovementFraction = plateauMinImprovementFraction)
-            } else {
-              plateauState
-            }
-          val plateauStopNow = terminalResult && evaluatedPlateauState.stop
-          val targetReached = nextLogicalRequestId > targetLogicalRequests
-          val terminalTransition =
-            if (terminalResult) {
-              Some(
-                C1BackendPressureCompletionWindowTransitions.afterTerminalCompletion(
-                  nextLogicalRequestId,
-                  remaining.size,
-                  targetLogicalRequests,
-                  plateauStopNow,
-                  stopDecision.exists(_._3.stop)))
-            } else {
-              None
-            }
-          val newNextLogicalRequestId = terminalTransition.map(_.nextLogicalRequestId).getOrElse(nextLogicalRequestId)
-          val refillLogicalRequestId = terminalTransition.flatMap(_.refillLogicalRequestId)
-          val nextInFlight =
-            refillLogicalRequestId.map(logicalRequestId => remaining :+ launch(logicalRequestId)).getOrElse {
-              if (terminalResult) remaining else Vector.empty
-            }
-          val stopLatched = terminalTransition.exists(_.stopLatched)
-          val latchedStopReason =
-            stopDecision.map(_._3.stopReason).filter(_.nonEmpty).getOrElse(evaluatedPlateauState.stopReason)
-          val newPlateauState =
-            if (stopLatched) evaluatedPlateauState.copy(stop = true, stopReason = latchedStopReason)
-            else evaluatedPlateauState
-          val newStopDecision = stopDecision.orElse {
-            if (plateauStopNow) {
-              Some(("complete", "completion_window_plateau_stop", newPlateauState, completedSoFar, completionElapsedNs))
-            } else if (terminalResult && targetReached && nextInFlight.isEmpty) {
-              Some(("complete", "completion_window_target_complete", newPlateauState, completedSoFar, completionElapsedNs))
-            } else {
-              None
-            }
-          }
-          emitC1BackendPressureWindowEvent(
-            request,
-            outcome.logicalRequestId,
-            submittedSoFar = newNextLogicalRequestId - 1,
-            completedSoFar = completedSoFar,
-            inFlightAfterCompletion = nextInFlight.size,
-            nextLogicalRequestId = refillLogicalRequestId,
-            outcome = outcome,
-            completionElapsedNs = if (terminalResult) Some(completionElapsedNs) else None,
-            rollingQps = if (newPlateauState.currentRollingQps > 0.0) Some(newPlateauState.currentRollingQps) else None,
-            rollingWindowSize = if (newPlateauState.rollingWindowSize > 0) Some(newPlateauState.rollingWindowSize) else None,
-            plateauDecision = if (stopLatched) Some("stop") else if (plateauEnabled) Some("continue") else None)
-          if (terminalResult) {
-            loop(
-              newNextLogicalRequestId,
-              nextInFlight,
-              accumulated :+ outcome,
-              completionTimesNs :+ completionElapsedNs,
-              newPlateauState,
-              newStopDecision)
-          } else {
-            val reason = outcome.result match {
-              case Right(result) => result.reason
-              case Left(error)   => error
-            }
-            emitC1BackendPressureRunDecision(
-              request,
-              newNextLogicalRequestId - 1,
-              0,
-              "invalid_non_terminal_completion_signal",
-              reason,
-              plateauRunDecisionFields(newPlateauState, completedSoFar, completionElapsedNs))
-            Future.successful(accumulated :+ outcome)
-          }
-        }
       }
     }
 
-    val initial = (1 to windowSize).toVector.map(launch)
-    loop(windowSize + 1, initial, Vector.empty, Vector.empty, C1BackendPressurePlateauState(rollingWindowSize = plateauWindowSize), None)
+    val initialBuilder = Vector.newBuilder[(Int, Future[C1BackendPressureOutcome])]
+    var nextInitialLogicalRequestId = 1
+    var initialDeadlineObserved = Option.empty[Long]
+    while (nextInitialLogicalRequestId <= windowSize && initialDeadlineObserved.isEmpty) {
+      val submitMonoNs = System.nanoTime()
+      if (C1BackendPressureCompletionWindowTransitions.deadlineReached(deadlineMonoNs, submitMonoNs)) {
+        initialDeadlineObserved = Some(submitMonoNs)
+      } else {
+        initialBuilder += launch(nextInitialLogicalRequestId, submitMonoNs)
+        nextInitialLogicalRequestId += 1
+      }
+    }
+    val initial = initialBuilder.result()
+    val initialPlateauState = C1BackendPressurePlateauState(rollingWindowSize = plateauWindowSize)
+    initialDeadlineObserved match {
+      case Some(observedMonoNs) =>
+        timeoutRunResult(nextInitialLogicalRequestId, initial, Vector.empty, initialPlateauState, observedMonoNs)
+      case None =>
+        loop(nextInitialLogicalRequestId, initial, Vector.empty, Vector.empty, initialPlateauState, None)
+    }
   }
 
   def backendPressureRoutes(user: Identity)(implicit transid: TransactionId) = {

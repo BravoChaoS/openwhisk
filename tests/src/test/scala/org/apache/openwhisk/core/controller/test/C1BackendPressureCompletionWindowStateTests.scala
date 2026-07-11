@@ -17,11 +17,15 @@
 
 package org.apache.openwhisk.core.controller.test
 
+import scala.concurrent.duration._
+import scala.concurrent.{Await, ExecutionContext, Promise}
 import org.junit.runner.RunWith
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.junit.JUnitRunner
 
+import org.apache.openwhisk.core.controller.C1BackendPressureCompletionBeforeDeadline
+import org.apache.openwhisk.core.controller.C1BackendPressureCompletionWindowDeadlineReached
 import org.apache.openwhisk.core.controller.C1BackendPressurePlateauState
 import org.apache.openwhisk.core.controller.C1BackendPressureCompletionWindowTransitions
 
@@ -67,6 +71,62 @@ class C1BackendPressureCompletionWindowStateTests extends AnyFlatSpec with Match
       plateauMinImprovementFraction = minImprovementFraction)
 
   behavior of "C1 backend-pressure completion-window transitions"
+
+  it should "bound completion waiting at the monotonic controller deadline" in {
+    implicit val executionContext: ExecutionContext = ExecutionContext.global
+    val runStartMonoNs = 1000000000L
+    val deadlineMonoNs =
+      C1BackendPressureCompletionWindowTransitions.completionWindowDeadlineMonoNs(runStartMonoNs, timeoutSec = 7)
+    deadlineMonoNs shouldBe 8000000000L
+
+    val completionBeforeDeadline = Promise[String]()
+    val pendingDeadline = Promise[Unit]()
+    val completed = C1BackendPressureCompletionWindowTransitions.firstCompletionOrDeadline(
+      completionBeforeDeadline.future,
+      pendingDeadline.future,
+      deadlineMonoNs,
+      () => deadlineMonoNs - 1L)
+    completionBeforeDeadline.success("terminal")
+    Await.result(completed, 1.second) shouldBe C1BackendPressureCompletionBeforeDeadline(
+      "terminal",
+      deadlineMonoNs - 1L)
+
+    val unresolvedCompletion = Promise[String]()
+    val reachedDeadline = Promise[Unit]()
+    val timedOut = C1BackendPressureCompletionWindowTransitions.firstCompletionOrDeadline(
+      unresolvedCompletion.future,
+      reachedDeadline.future,
+      deadlineMonoNs,
+      () => deadlineMonoNs)
+    reachedDeadline.success(())
+    Await.result(timedOut, 1.second) shouldBe C1BackendPressureCompletionWindowDeadlineReached(deadlineMonoNs)
+    unresolvedCompletion.isCompleted shouldBe false
+
+    val lateCompletion = Promise[String]()
+    val delayedDeadlineSignal = Promise[Unit]()
+    val late = C1BackendPressureCompletionWindowTransitions.firstCompletionOrDeadline(
+      lateCompletion.future,
+      delayedDeadlineSignal.future,
+      deadlineMonoNs,
+      () => deadlineMonoNs)
+    lateCompletion.success("too-late")
+    Await.result(late, 1.second) shouldBe C1BackendPressureCompletionWindowDeadlineReached(deadlineMonoNs)
+  }
+
+  it should "block refill at deadline without changing the plateau latch" in {
+    val atDeadline = C1BackendPressureCompletionWindowTransitions.afterTerminalCompletion(
+      nextLogicalRequestId = 1230,
+      remainingInFlight = 199,
+      targetLogicalRequests = 100000,
+      plateauStopNow = false,
+      stopAlreadyLatched = false,
+      refillAllowed = false)
+
+    atDeadline.refillLogicalRequestId shouldBe None
+    atDeadline.nextLogicalRequestId - 1 shouldBe 1229
+    atDeadline.inFlightAfterCompletion shouldBe 199
+    atDeadline.stopLatched shouldBe false
+  }
 
   it should "start the no-improve clock only after both warmup gates" in {
     val initial = C1BackendPressurePlateauState(rollingWindowSize = plateauWindowSize)
