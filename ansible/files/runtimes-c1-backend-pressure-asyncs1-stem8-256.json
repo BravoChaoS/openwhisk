@@ -32,6 +32,7 @@
                     "tag": "e3-hw-20260614"
                 },
                 "deprecated": false,
+                "sentinelledLogs": false,
                 "stemCells": [
                     {
                         "count": 8,
