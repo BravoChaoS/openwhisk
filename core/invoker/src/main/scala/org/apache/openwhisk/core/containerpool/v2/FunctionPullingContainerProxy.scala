@@ -59,7 +59,7 @@ import spray.json._
 import pureconfig.generic.auto._
 
 import scala.concurrent.duration._
-import scala.concurrent.Future
+import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
 
 // Events used internally
@@ -1250,14 +1250,19 @@ class FunctionPullingContainerProxy(
               msg.transid)
             Future.failed(ContainerHealthError(msg.transid, c1InternalRescheduleInjectionReason))
           } else {
-            container.run(
-              parameters,
-              env.toJson.asJsObject,
-              actionTimeout,
-              action.limits.concurrency.maxConcurrent,
-              msg.user.limits.allowedMaxPayloadSize,
-              msg.user.limits.allowedTruncationSize,
-              resumeRun.isDefined)(msg.transid)
+            FunctionPullingContainerProxy.withC1NativeBackendPressureExecutionBoundaries(
+              isBackendPressureActivation(msg),
+              action.exec.kind,
+              (eventCode, boundaryName) => emitC1TimingEvent(eventCode, boundaryName, msg)) {
+              container.run(
+                parameters,
+                env.toJson.asJsObject,
+                actionTimeout,
+                action.limits.concurrency.maxConcurrent,
+                msg.user.limits.allowedMaxPayloadSize,
+                msg.user.limits.allowedTruncationSize,
+                resumeRun.isDefined)(msg.transid)
+            }
           }
 
         runResult
@@ -1440,6 +1445,26 @@ class FunctionPullingContainerProxy(
 }
 
 object FunctionPullingContainerProxy {
+  private[containerpool] def withC1NativeBackendPressureExecutionBoundaries[T](
+    markedBackendPressure: Boolean,
+    actionKind: String,
+    emit: (String, String) => Unit)(run: => Future[T])(implicit executionContext: ExecutionContext): Future[T] = {
+    if (markedBackendPressure && actionKind == "nodejs:20") {
+      emit("N400", "native_action_container_run_enter")
+      Try(run) match {
+        case Success(future) =>
+          future.andThen {
+            case _ => emit("N410", "native_action_container_run_exit")
+          }
+        case Failure(t) =>
+          emit("N410", "native_action_container_run_exit")
+          Future.failed(t)
+      }
+    } else {
+      run
+    }
+  }
+
   private val c1AsynCSProducerEventCodes =
     Set("A200", "A210", "A300", "A310", "A320", "A330", "A340", "A350", "A400", "A410")
   private val c1AsynCSTraceEvidenceFields = Seq(

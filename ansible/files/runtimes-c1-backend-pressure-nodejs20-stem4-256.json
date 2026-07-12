@@ -1,0 +1,32 @@
+{
+    "description": [
+        "C1 backend-pressure native runtime manifest for the four-slot control.",
+        "Keep nodejs:20 at 256 MB and create four initial stem cells per invoker.",
+        "Pair with invoker userMemory=1024m; physical idle replacements are not execution slots."
+    ],
+    "runtimes": {
+        "nodejs": [
+            {
+                "kind": "nodejs:20",
+                "default": true,
+                "image": {
+                    "prefix": "openwhisk",
+                    "name": "action-nodejs-v20",
+                    "tag": "nightly"
+                },
+                "deprecated": false,
+                "attached": {
+                    "attachmentName": "codefile",
+                    "attachmentType": "text/plain"
+                },
+                "stemCells": [
+                    {
+                        "count": 4,
+                        "memory": "256 MB"
+                    }
+                ]
+            }
+        ]
+    },
+    "blackboxes": []
+}
