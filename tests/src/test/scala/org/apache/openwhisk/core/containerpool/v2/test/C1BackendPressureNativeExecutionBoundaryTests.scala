@@ -32,12 +32,12 @@ class C1BackendPressureNativeExecutionBoundaryTests extends AnyFlatSpec with Mat
       actionKind = "nodejs:20",
       emit = (code, boundary) => emitted += code -> boundary)(result.future)
 
-    emitted.toSeq shouldBe Seq("N400" -> "native_action_container_run_enter")
+    emitted.toSeq shouldBe Seq("N420" -> "native_action_container_run_enter")
     result.success("ok")
     Await.result(wrapped, 2.seconds) shouldBe "ok"
     emitted.toSeq shouldBe Seq(
-      "N400" -> "native_action_container_run_enter",
-      "N410" -> "native_action_container_run_exit")
+      "N420" -> "native_action_container_run_enter",
+      "N430" -> "native_action_container_run_exit")
   }
 
   it should "leave unmarked and non-native runs untouched" in {
@@ -69,6 +69,6 @@ class C1BackendPressureNativeExecutionBoundaryTests extends AnyFlatSpec with Mat
 
     result.failure(new RuntimeException("fixture failure"))
     Await.ready(wrapped, 2.seconds)
-    emitted.map(_._1).toSeq shouldBe Seq("N400", "N410")
+    emitted.map(_._1).toSeq shouldBe Seq("N420", "N430")
   }
 }

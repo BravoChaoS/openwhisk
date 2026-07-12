@@ -1450,14 +1450,14 @@ object FunctionPullingContainerProxy {
     actionKind: String,
     emit: (String, String) => Unit)(run: => Future[T])(implicit executionContext: ExecutionContext): Future[T] = {
     if (markedBackendPressure && actionKind == "nodejs:20") {
-      emit("N400", "native_action_container_run_enter")
+      emit("N420", "native_action_container_run_enter")
       Try(run) match {
         case Success(future) =>
           future.andThen {
-            case _ => emit("N410", "native_action_container_run_exit")
+            case _ => emit("N430", "native_action_container_run_exit")
           }
         case Failure(t) =>
-          emit("N410", "native_action_container_run_exit")
+          emit("N430", "native_action_container_run_exit")
           Future.failed(t)
       }
     } else {
