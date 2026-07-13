@@ -258,6 +258,8 @@ class FunctionPullingContainerProxy(
     .get("C1_INTERNAL_RESCHEDULE_INJECTION_ENABLED")
     .map(_.trim.toLowerCase)
     .exists(value => value == "1" || value == "true" || value == "yes")
+  private val reusableConcurrencySkipActivationStore =
+    FunctionPullingContainerProxy.reusableConcurrencyStoreSkipEnabled(sys.env)
 
   private def c1TimingSanitize(value: String): String =
     value.replace('|', '_').replace('\n', ' ').replace('\r', ' ')
@@ -273,6 +275,7 @@ class FunctionPullingContainerProxy(
   private def guardedStoreActivation(tid: TransactionId,
                                      activation: WhiskActivation,
                                      msg: ActivationMessage,
+                                     actionKind: String,
                                      isBlocking: Boolean,
                                      context: UserContext): Future[Any] = {
     if (shouldSkipBackendPressureActivationStore(msg)) {
@@ -286,7 +289,26 @@ class FunctionPullingContainerProxy(
       logging.info(this, s"C1_BACKEND_PRESSURE_SKIP_STORE|${fields.mkString("|")}")(tid)
       Future.successful(())
     } else {
-      storeActivation(tid, activation, isBlocking, context)
+      val skipReason = FunctionPullingContainerProxy.reusableConcurrencyStoreSkipReason(
+        reusableConcurrencySkipActivationStore,
+        actionKind)
+      skipReason.foreach { reason =>
+        val fields = Seq(
+          c1TimingField("activation_id", msg.activationId.asString),
+          c1TimingField("tid", tid.id),
+          c1TimingField("namespace", msg.user.namespace.name.asString),
+          c1TimingField("blocking", isBlocking.toString),
+          c1TimingField("status_code", activation.response.statusCode.toString),
+          c1TimingField("profile", "reusable-concurrency"),
+          c1TimingField("action_kind", actionKind),
+          c1TimingField("store_status", "skipped"),
+          c1TimingField("store_path", "not_on_path"),
+          c1TimingField("reason", reason))
+        logging.info(this, s"REUSABLE_CONCURRENCY_SKIP_STORE|${fields.mkString("|")}")(tid)
+      }
+      FunctionPullingContainerProxy.storeActivationUnlessSkipped(skipReason) {
+        storeActivation(tid, activation, isBlocking, context)
+      }
     }
   }
 
@@ -1218,7 +1240,7 @@ class FunctionPullingContainerProxy(
               msg.rootControllerIndex,
               msg.user.namespace.uuid,
               CombinedCompletionAndResultMessage(transid, activation, instance))
-            guardedStoreActivation(msg.transid, activation, msg, msg.blocking, context)
+            guardedStoreActivation(msg.transid, activation, msg, action.exec.kind, msg.blocking, context)
 
             // in case action is removed container proxy should be terminated
             Future.failed(new IllegalStateException(errMsg))
@@ -1276,6 +1298,7 @@ class FunctionPullingContainerProxy(
       data.resumeRun.msg.transid,
       activation,
       data.resumeRun.msg,
+      data.action.exec.kind,
       data.resumeRun.msg.blocking,
       context)
   }
@@ -1579,7 +1602,7 @@ class FunctionPullingContainerProxy(
         }
 
         // Storing the record. Entirely asynchronous and not waited upon.
-        guardedStoreActivation(tid, activation, msg, msg.blocking, context)
+        guardedStoreActivation(tid, activation, msg, action.exec.kind, msg.blocking, context)
       }
 
     // Disambiguate activation errors and transform the Either into a failed/successful Future respectively.
@@ -1626,9 +1649,27 @@ class FunctionPullingContainerProxy(
 }
 
 object FunctionPullingContainerProxy {
+  val ReusableConcurrencySkipActivationStoreEnv = "REUSABLE_CONCURRENCY_SKIP_ACTIVATION_STORE"
+  private[containerpool] val ReusableConcurrencyStoreSkipReason = "reusable_concurrency_profile_store_skip"
   private val P2ResultEnvelopeField = "__reusable_protected_result_envelope"
   private val P2RequestIdHashField = "__reusable_request_id_hash"
   private val P2TargetBindingField = "__reusable_target_binding_id"
+
+  private[containerpool] def reusableConcurrencyStoreSkipEnabled(environment: Map[String, String]): Boolean =
+    environment
+      .get(ReusableConcurrencySkipActivationStoreEnv)
+      .exists(value => Set("1", "true", "yes").contains(value.trim.toLowerCase))
+
+  private[containerpool] def reusableConcurrencyStoreSkipReason(enabled: Boolean, actionKind: String): Option[String] =
+    if (enabled && actionKind == TargetBindingProvider.ReusableConcurrencyKind) {
+      Some(ReusableConcurrencyStoreSkipReason)
+    } else {
+      None
+    }
+
+  private[containerpool] def storeActivationUnlessSkipped(skipReason: Option[String])(
+    store: => Future[Any]): Future[Any] =
+    skipReason.fold(store)(_ => Future.successful(()))
 
   private[containerpool] def targetBoundInitializer(action: ExecutableWhiskAction,
                                                     environment: Map[String, JsValue],

@@ -180,6 +180,48 @@ class TargetBoundRuntimeContractTests
     result.targetEnvelope shouldBe targetResult
   }
 
+  behavior of "reusable-concurrency activation store policy"
+
+  it should "skip the store callback only for an enabled reusable-concurrency profile" in {
+    val enabled = FunctionPullingContainerProxy.reusableConcurrencyStoreSkipEnabled(
+      Map(FunctionPullingContainerProxy.ReusableConcurrencySkipActivationStoreEnv -> "true"))
+    val skipReason = FunctionPullingContainerProxy.reusableConcurrencyStoreSkipReason(
+      enabled,
+      TargetBindingProvider.ReusableConcurrencyKind)
+    @volatile var storeCalled = false
+
+    Await.result(
+      FunctionPullingContainerProxy.storeActivationUnlessSkipped(skipReason) {
+        storeCalled = true
+        Future.successful(())
+      },
+      3.seconds)
+
+    skipReason shouldBe Some(FunctionPullingContainerProxy.ReusableConcurrencyStoreSkipReason)
+    storeCalled shouldBe false
+  }
+
+  it should "retain the store callback for ordinary actions and a disabled profile gate" in {
+    val ordinaryReason = FunctionPullingContainerProxy.reusableConcurrencyStoreSkipReason(
+      enabled = true,
+      actionKind = "nodejs:20")
+    val disabledReason = FunctionPullingContainerProxy.reusableConcurrencyStoreSkipReason(
+      enabled = false,
+      actionKind = TargetBindingProvider.ReusableConcurrencyKind)
+    @volatile var ordinaryStoreCalls = 0
+
+    Await.result(
+      FunctionPullingContainerProxy.storeActivationUnlessSkipped(ordinaryReason) {
+        ordinaryStoreCalls += 1
+        Future.successful(())
+      },
+      3.seconds)
+
+    ordinaryReason shouldBe None
+    disabledReason shouldBe None
+    ordinaryStoreCalls shouldBe 1
+  }
+
   private val correlation = ByteString.fromArray((0 until 32).map(_.toByte).toArray)
   private val requestHash = correlation.map(byte => f"${byte & 0xff}%02x").mkString
   private val targetInput = ProtectedEnvelopeV1(
