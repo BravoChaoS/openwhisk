@@ -1,0 +1,39 @@
+{
+  "description": [
+    "C1 reusable-concurrency S1 manifest.",
+    "Exactly one worker and one managed container are allowed before the S2 endpoint allocator."
+  ],
+  "runtimes": {
+    "nodejs": [
+      {
+        "kind": "nodejs:20",
+        "default": true,
+        "image": {
+          "prefix": "openwhisk",
+          "name": "action-nodejs-v20",
+          "tag": "nightly"
+        },
+        "deprecated": false,
+        "attached": {
+          "attachmentName": "codefile",
+          "attachmentType": "text/plain"
+        }
+      }
+    ],
+    "reusable-concurrency": [
+      {
+        "kind": "reusable-concurrency:1",
+        "default": true,
+        "image": {
+          "registry": "172.18.89.214:5000",
+          "prefix": "whisk",
+          "name": "reusable-concurrency-s1",
+          "tag": "p3"
+        },
+        "deprecated": false,
+        "sentinelledLogs": false
+      }
+    ]
+  },
+  "blackboxes": []
+}
