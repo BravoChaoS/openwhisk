@@ -106,8 +106,7 @@ class FPCInvokerReactive(config: WhiskConfig,
         value
       }
 
-      val invokerHosts = config.invokerHosts.split(',').map(_.trim).filter(_.nonEmpty)
-      require(instance.toInt < invokerHosts.length, s"invoker host is unavailable for $instance")
+      val targetEndpointHost = required(TargetBindingProvider.BridgeControlHostEnv)
       val gatewayConfig = GatewayControlConfig(
         enabled = true,
         host = required("REUSABLE_GATEWAY_CONTROL_HOST"),
@@ -118,7 +117,7 @@ class FPCInvokerReactive(config: WhiskConfig,
       val gatewayExecutionContext = actorSystem.dispatchers.lookup("dispatchers.gateway-control-dispatcher")
       val gatewayClient = new P1GatewayControlClient(gatewayConfig)(gatewayExecutionContext)
       val bridgeClient = new HttpTargetEndpointBridgeClient(
-        required(TargetBindingProvider.BridgeControlHostEnv),
+        targetEndpointHost,
         positiveInt(TargetBindingProvider.BridgeControlPortEnv),
         gatewayConfig.connectTimeout,
         gatewayConfig.readTimeout)(gatewayExecutionContext)
@@ -126,7 +125,7 @@ class FPCInvokerReactive(config: WhiskConfig,
       new GatewayTargetBindingProvider(
         gatewayClient,
         bridgeClient,
-        invokerHosts(instance.toInt),
+        targetEndpointHost,
         targetDhPort,
         targetDhPort,
         positiveInt("REUSABLE_TARGET_READY_TIMEOUT_MS", Some(60000)).millis,
