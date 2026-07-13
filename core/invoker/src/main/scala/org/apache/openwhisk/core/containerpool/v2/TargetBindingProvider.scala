@@ -17,17 +17,31 @@
 
 package org.apache.openwhisk.core.containerpool.v2
 
-import org.apache.openwhisk.core.containerpool.{ContainerAddress, ContainerId}
+import java.net.{HttpURLConnection, URL, URLEncoder}
+import java.nio.charset.StandardCharsets
 
+import org.apache.pekko.actor.ActorSystem
+import org.apache.pekko.pattern.after
+import org.apache.openwhisk.core.containerpool.{ContainerAddress, ContainerId}
+import org.apache.openwhisk.core.scheduler.queue.GatewayControlClient
+import spray.json._
+
+import scala.concurrent.blocking
+import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
+import scala.util.{Failure, Success}
 
 /** Opaque control-side handle for one ACTIVE container target. */
 final case class TargetBinding(id: Long) {
   require(id > 0, "target binding id must be positive")
 }
 
-/** Concrete container identity supplied to a profile-specific binding provider. */
-final case class TargetContainer(containerId: ContainerId, address: ContainerAddress, kind: String)
+/** Concrete container identity and its executor binding writer. */
+final case class TargetContainer(containerId: ContainerId,
+                                 address: ContainerAddress,
+                                 kind: String,
+                                 activateBinding: (Long, FiniteDuration) => Future[Unit])
 
 /**
  * Lifecycle seam implemented by profiles that require target-bound dispatch.
@@ -41,6 +55,10 @@ trait TargetBindingProvider {
 
 object TargetBindingProvider {
 
+  val ReusableConcurrencyKind = "reusable-concurrency:1"
+  val BridgeControlHostEnv = "REUSABLE_TARGET_BRIDGE_CONTROL_HOST"
+  val BridgeControlPortEnv = "REUSABLE_TARGET_BRIDGE_CONTROL_PORT"
+
   /** Existing profiles explicitly have no target-binding lifecycle. */
   object Disabled extends TargetBindingProvider {
     override def requiresBinding(kind: String): Boolean = false
@@ -51,4 +69,130 @@ object TargetBindingProvider {
     override def closeBinding(target: TargetContainer, binding: TargetBinding): Future[Unit] =
       Future.failed(new IllegalStateException("target binding provider is disabled"))
   }
+}
+
+/** Worker-local S1 bridge that maps one public DH endpoint to one concrete container endpoint. */
+trait TargetEndpointBridgeClient {
+  def bind(containerIdentity: String, targetHost: String, targetPort: Int): Future[Unit]
+  def unbind(containerIdentity: String): Future[Unit]
+}
+
+final class HttpTargetEndpointBridgeClient(controlHost: String,
+                                           controlPort: Int,
+                                           connectTimeout: FiniteDuration,
+                                           readTimeout: FiniteDuration)(implicit ec: ExecutionContext)
+    extends TargetEndpointBridgeClient {
+
+  require(controlHost.nonEmpty, "target bridge control host must not be empty")
+  require(controlPort > 0 && controlPort <= 65535, "target bridge control port is invalid")
+
+  override def bind(containerIdentity: String, targetHost: String, targetPort: Int): Future[Unit] = {
+    val body = JsObject(
+      "containerIdentity" -> JsString(containerIdentity),
+      "targetHost" -> JsString(targetHost),
+      "targetPort" -> JsNumber(targetPort)).compactPrint
+    request("PUT", "/binding", Some(body))
+  }
+
+  override def unbind(containerIdentity: String): Future[Unit] =
+    request("DELETE", s"/binding/${URLEncoder.encode(containerIdentity, StandardCharsets.UTF_8.name())}", None)
+
+  private def request(method: String, path: String, body: Option[String]): Future[Unit] = Future {
+    blocking {
+      val connection =
+        new URL(s"http://$controlHost:$controlPort$path").openConnection().asInstanceOf[HttpURLConnection]
+      try {
+        connection.setConnectTimeout(timeoutMillis(connectTimeout))
+        connection.setReadTimeout(timeoutMillis(readTimeout))
+        connection.setRequestMethod(method)
+        body.foreach { value =>
+          val bytes = value.getBytes(StandardCharsets.UTF_8)
+          connection.setDoOutput(true)
+          connection.setRequestProperty("Content-Type", "application/json")
+          connection.setFixedLengthStreamingMode(bytes.length)
+          val output = connection.getOutputStream
+          try output.write(bytes)
+          finally output.close()
+        }
+        val status = connection.getResponseCode
+        Option(if (status / 100 == 2) connection.getInputStream else connection.getErrorStream).foreach(_.close())
+        if (status / 100 != 2) {
+          throw new IllegalStateException(s"target endpoint bridge $method failed: status=$status")
+        }
+      } finally connection.disconnect()
+    }
+  }
+
+  private def timeoutMillis(duration: FiniteDuration): Int =
+    math.min(duration.toMillis, Int.MaxValue.toLong).toInt
+}
+
+/**
+ * Experiment-scoped provider backed by the real control Gateway P1 wire.
+ * Registration completes only after P1 reports ACTIVE and the same concrete
+ * executor accepts the opaque binding id.
+ */
+final class GatewayTargetBindingProvider(
+  gatewayClient: GatewayControlClient,
+  bridgeClient: TargetEndpointBridgeClient,
+  endpointHost: String,
+  endpointPort: Int,
+  containerEndpointPort: Int,
+  readyTimeout: FiniteDuration,
+  retryInterval: FiniteDuration)(implicit actorSystem: ActorSystem, ec: ExecutionContext)
+    extends TargetBindingProvider {
+
+  require(endpointHost.nonEmpty, "target endpoint host must not be empty")
+  require(endpointPort > 0 && endpointPort <= 65535, "target endpoint port is invalid")
+  require(containerEndpointPort > 0 && containerEndpointPort <= 65535, "container target endpoint port is invalid")
+  require(readyTimeout.toMillis > 0, "target readiness timeout must be positive")
+  require(retryInterval.toMillis > 0, "target readiness retry interval must be positive")
+
+  override def requiresBinding(kind: String): Boolean = kind == TargetBindingProvider.ReusableConcurrencyKind
+
+  override def awaitReady(target: TargetContainer): Future[TargetBinding] = {
+    require(requiresBinding(target.kind), s"target binding is not enabled for ${target.kind}")
+    val deadline = readyTimeout.fromNow
+    val containerIdentity = target.containerId.asString
+
+    def register(): Future[TargetBinding] =
+      gatewayClient
+        .registerTarget(containerIdentity, endpointHost, endpointPort)
+        .flatMap {
+          case Right(registered) =>
+            target
+              .activateBinding(registered.targetBindingId, readyTimeout)
+              .map(_ => TargetBinding(registered.targetBindingId))
+              .recoverWith {
+                case activationFailure =>
+                  closeGateway(registered.targetBindingId).transformWith(_ => Future.failed(activationFailure))
+              }
+          case Left(error) if deadline.hasTimeLeft() =>
+            after(retryInterval, actorSystem.scheduler)(register())
+          case Left(error) =>
+            Future.failed(new IllegalStateException(s"Gateway target registration failed: ${error.message}"))
+        }
+
+    bridgeClient
+      .bind(containerIdentity, target.address.host, containerEndpointPort)
+      .flatMap { _ =>
+        register().recoverWith {
+          case failure =>
+            bridgeClient.unbind(containerIdentity).transformWith(_ => Future.failed(failure))
+        }
+      }
+  }
+
+  override def closeBinding(target: TargetContainer, binding: TargetBinding): Future[Unit] =
+    closeGateway(binding.id).transformWith {
+      case Success(_) => bridgeClient.unbind(target.containerId.asString)
+      case Failure(closeFailure) =>
+        bridgeClient.unbind(target.containerId.asString).transformWith(_ => Future.failed(closeFailure))
+    }
+
+  private def closeGateway(targetBindingId: Long): Future[Unit] =
+    gatewayClient.closeTarget(targetBindingId).flatMap {
+      case Right(_)    => Future.successful(())
+      case Left(error) => Future.failed(new IllegalStateException(s"Gateway target close failed: ${error.message}"))
+    }
 }

@@ -109,6 +109,100 @@ class GatewayControlClientTests extends AnyFlatSpec with Matchers {
     }
   }
 
+  it should "register an ACTIVE target and close the same binding over the P1 wire" in {
+    withGateway { server =>
+      val observed = Future {
+        val register = server.accept()
+        try {
+          val request = ByteString.fromArray(register.getInputStream.readAllBytes())
+          decodeOuterType(request) shouldBe P1GatewayControlClient.RegisterTargetRequestType
+          val body = ByteBuffer
+            .wrap(request.drop(P1GatewayControlClient.OuterHeaderSize).toArray)
+            .order(ByteOrder.BIG_ENDIAN)
+          body.get() shouldBe 1.toByte
+          body.position(4)
+          (body.getShort() & 0xffff) shouldBe 18888
+          body.getShort() shouldBe 0.toShort
+          val identity = new Array[Byte](128)
+          val host = new Array[Byte](64)
+          body.get(identity)
+          body.get(host)
+          new String(identity.takeWhile(_ != 0), "UTF-8") shouldBe "container-1"
+          new String(host.takeWhile(_ != 0), "UTF-8") shouldBe "172.18.89.215"
+
+          val responseBody = ByteBuffer.allocate(20).order(ByteOrder.BIG_ENDIAN)
+          responseBody.put(1.toByte).put(2.toByte).putShort(0).putInt(0).putLong(41).putInt(7)
+          writeResponse(
+            register,
+            P1GatewayControlClient.RegisterTargetResponseType,
+            ByteString.fromArray(responseBody.array()))
+        } finally register.close()
+
+        val close = server.accept()
+        try {
+          val request = ByteString.fromArray(close.getInputStream.readAllBytes())
+          decodeOuterType(request) shouldBe P1GatewayControlClient.CloseTargetRequestType
+          val body = ByteBuffer
+            .wrap(request.drop(P1GatewayControlClient.OuterHeaderSize).toArray)
+            .order(ByteOrder.BIG_ENDIAN)
+          body.get() shouldBe 1.toByte
+          body.position(8)
+          body.getLong() shouldBe 41L
+          val responseBody = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN)
+          responseBody.put(1.toByte).put(Array.fill[Byte](3)(0)).putInt(0)
+          writeResponse(close, P1GatewayControlClient.CloseTargetResponseType, ByteString.fromArray(responseBody.array()))
+        } finally close.close()
+      }
+
+      val client = new P1GatewayControlClient(config(server.getLocalPort))
+      Await.result(client.registerTarget("container-1", "172.18.89.215", 18888), 5.seconds) shouldBe
+        Right(GatewayRegisteredTarget(41, 7))
+      Await.result(client.closeTarget(41), 5.seconds) shouldBe Right(())
+      Await.result(observed, 5.seconds)
+    }
+  }
+
+  it should "finalize a T2G result into a G2S envelope with source correlation" in {
+    val targetResult = targetVector.copy(
+      kind = ProtectedObjectKind.Result,
+      direction = ProtectedEnvelopeDirection.TargetToGateway,
+      iv = fromHex("8123456789abcdeffedcba98"))
+    val sourceResult = targetResult.copy(
+      direction = ProtectedEnvelopeDirection.GatewayToSource,
+      bindingId = 17,
+      iv = fromHex("9123456789abcdeffedcba98"))
+    withGateway { server =>
+      val observed = Future {
+        val socket = server.accept()
+        try {
+          val request = ByteString.fromArray(socket.getInputStream.readAllBytes())
+          decodeOuterType(request) shouldBe P1GatewayControlClient.ReencryptRequestType
+          val body = ByteBuffer
+            .wrap(request.drop(P1GatewayControlClient.OuterHeaderSize).toArray)
+            .order(ByteOrder.BIG_ENDIAN)
+          body.get() shouldBe 1.toByte
+          body.get() shouldBe 2.toByte
+          body.getShort() shouldBe 0.toShort
+          body.getLong() shouldBe 17L
+          body.getLong() shouldBe targetResult.bindingId
+          val envelopeSize = body.getInt()
+          val envelope = new Array[Byte](envelopeSize)
+          body.get(envelope)
+          ByteString.fromArray(envelope) shouldBe targetResult.bytes
+          writeResponse(
+            socket,
+            P1GatewayControlClient.ReencryptResponseType,
+            encodeResponse(status = 0, sourceResult.bytes, operation = 2))
+        } finally socket.close()
+      }
+
+      val client = new P1GatewayControlClient(config(server.getLocalPort))
+      Await.result(client.reencryptResultToSource(17, targetResult.bindingId, targetResult), 5.seconds) shouldBe
+        Right(sourceResult)
+      Await.result(observed, 5.seconds)
+    }
+  }
+
   private def withGateway(test: ServerSocket => Unit): Unit = {
     val server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress)
     try test(server)
@@ -124,17 +218,27 @@ class GatewayControlClientTests extends AnyFlatSpec with Matchers {
       readTimeout = 2.seconds,
       maxEnvelopeBytes = 4096)
 
-  private def encodeResponse(status: Int, envelope: ByteString): ByteString = {
+  private def encodeResponse(status: Int, envelope: ByteString, operation: Int = 1): ByteString = {
     val output = ByteBuffer
       .allocate(P1GatewayControlClient.ReencryptResponsePrefixSize + envelope.length)
       .order(ByteOrder.BIG_ENDIAN)
     output.put(1.toByte)
-    output.put(1.toByte)
+    output.put(operation.toByte)
     output.putShort(0)
     output.putInt(status)
     output.putInt(envelope.length)
     output.put(envelope.toArray)
     ByteString.fromArray(output.array())
+  }
+
+  private def decodeOuterType(request: ByteString): Int =
+    ByteBuffer.wrap(request.take(P1GatewayControlClient.OuterHeaderSize).toArray).order(ByteOrder.nativeOrder()).getInt()
+
+  private def writeResponse(socket: java.net.Socket, responseType: Int, body: ByteString): Unit = {
+    val output = socket.getOutputStream
+    output.write(P1GatewayControlClient.encodeOuterFrame(responseType, body.length).toArray)
+    output.write(body.toArray)
+    output.flush()
   }
 
   private val targetVector = ProtectedEnvelopeV1

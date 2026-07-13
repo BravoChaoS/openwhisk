@@ -20,6 +20,7 @@ package org.apache.openwhisk.core.containerpool.v2
 import java.lang.management.ManagementFactory
 import java.net.InetSocketAddress
 import java.time.Instant
+import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import org.apache.pekko.actor.Status.{Failure => FailureMessage}
 import org.apache.pekko.actor.{ActorRef, ActorRefFactory, ActorSystem, FSM, Props, Stash}
@@ -50,6 +51,12 @@ import org.apache.openwhisk.core.etcd.EtcdKV.ContainerKeys
 import org.apache.openwhisk.core.invoker.Invoker.LogsCollector
 import org.apache.openwhisk.core.invoker.NamespaceBlacklist
 import org.apache.openwhisk.core.scheduler.SchedulerEndpoints
+import org.apache.openwhisk.core.scheduler.queue.{
+  ProtectedEnvelopeDirection,
+  ProtectedEnvelopeV1,
+  ProtectedObjectKind,
+  TargetBoundActivationContent
+}
 import org.apache.openwhisk.core.service.{RegisterData, UnregisterData}
 import org.apache.openwhisk.grpc.RescheduleResponse
 import org.apache.openwhisk.http.Messages
@@ -383,7 +390,11 @@ class FunctionPullingContainerProxy(
   private def awaitTargetBinding(container: Container,
                                  kind: String): Future[Option[(TargetContainer, TargetBinding)]] = {
     if (targetBindingProvider.requiresBinding(kind)) {
-      val target = TargetContainer(container.containerId, container.addr, kind)
+      val target = TargetContainer(
+        container.containerId,
+        container.addr,
+        kind,
+        (bindingId, timeout) => container.activateTargetBinding(bindingId, timeout)(TransactionId.invokerNanny))
       targetBindingProvider.awaitReady(target).map(binding => Some(target -> binding))
     } else {
       Future.successful(None)
@@ -976,6 +987,9 @@ class FunctionPullingContainerProxy(
   }
 
   whenUnhandled {
+    case Event(PingCache, data: WarmData) if data.action.exec.kind == TargetBindingProvider.ReusableConcurrencyKind =>
+      logging.debug(this, "target-bound action code is owned by the concrete executor; skip worker DB cache ping")
+      stay
     case Event(PingCache, data: WarmData) =>
       val actionId = data.action.fullyQualifiedName(false).toDocId.asDocInfo(data.revision)
       get(entityStore, actionId.id, actionId.rev, true, false).map(_ => {
@@ -1134,23 +1148,38 @@ class FunctionPullingContainerProxy(
       if (actionid.rev == DocRevision.empty)
         logging.warn(this, s"revision was not provided for ${actionid.id}")
 
-      get(entityStore, actionid.id, actionid.rev, actionid.rev != DocRevision.empty, false)
-        .flatMap { action =>
-          {
-            // action that exceed the limit cannot be executed
-            action.limits.checkLimits(msg.user)
-            action.toExecutableWhiskAction match {
-              case Some(executable) =>
-                Future.successful(RunActivation(executable, msg))
-              case None =>
-                logging
-                  .error(this, s"non-executable action reached the invoker ${action.fullyQualifiedName(false)}")
-                Future.failed(new IllegalStateException("non-executable action reached the invoker"))
-            }
+      val runActivation =
+        if (action.exec.kind == TargetBindingProvider.ReusableConcurrencyKind) {
+          TargetBoundActivationContent.parseTargetDispatch(msg.content) match {
+            case Right(dispatch) if dispatch.exactRevision == msg.revision && msg.revision == action.rev =>
+              action.limits.checkLimits(msg.user)
+              Future.successful(RunActivation(action, msg))
+            case Right(_) =>
+              Future.failed(
+                new IllegalStateException("target-bound activation revision does not match container action"))
+            case Left(error) => Future.failed(new IllegalStateException(error.targetReencryptionError))
           }
+        } else {
+          get(entityStore, actionid.id, actionid.rev, actionid.rev != DocRevision.empty, false)
+            .flatMap { fetchedAction =>
+              // action that exceed the limit cannot be executed
+              fetchedAction.limits.checkLimits(msg.user)
+              fetchedAction.toExecutableWhiskAction match {
+                case Some(executable) =>
+                  Future.successful(RunActivation(executable, msg))
+                case None =>
+                  logging.error(
+                    this,
+                    s"non-executable action reached the invoker ${fetchedAction.fullyQualifiedName(false)}")
+                  Future.failed(new IllegalStateException("non-executable action reached the invoker"))
+              }
+            }
         }
+
+      runActivation
         .recoverWith {
-          case DocumentRevisionMismatchException(_) =>
+          case DocumentRevisionMismatchException(_)
+              if action.exec.kind != TargetBindingProvider.ReusableConcurrencyKind =>
             // if revision is mismatched, the action may have been updated,
             // so try again with the latest code
             logging.warn(
@@ -1161,17 +1190,22 @@ class FunctionPullingContainerProxy(
             // If the action cannot be found, the user has concurrently deleted it,
             // making this an application error. All other errors are considered system
             // errors and should cause the invoker to be considered unhealthy.
-            val response = t match {
-              case _: NoDocumentException =>
-                ExecutionResponse.applicationError(Messages.actionRemovedWhileInvoking)
-              case e: ActionLimitsException =>
-                ExecutionResponse.applicationError(e.getMessage) // return generated failed message
-              case _: DocumentTypeMismatchException | _: DocumentUnreadable =>
-                ExecutionResponse.whiskError(Messages.actionMismatchWhileInvoking)
-              case e: Throwable =>
-                logging.error(this, s"An unknown DB connection error occurred while fetching an action: $e.")
-                ExecutionResponse.whiskError(Messages.actionFetchErrorWhileInvoking)
-            }
+            val response =
+              if (action.exec.kind == TargetBindingProvider.ReusableConcurrencyKind) {
+                logging.error(this, s"target-bound activation contract rejected: ${t.getMessage}")
+                ExecutionResponse.whiskError("target-bound activation contract rejected")
+              } else
+                t match {
+                  case _: NoDocumentException =>
+                    ExecutionResponse.applicationError(Messages.actionRemovedWhileInvoking)
+                  case e: ActionLimitsException =>
+                    ExecutionResponse.applicationError(e.getMessage) // return generated failed message
+                  case _: DocumentTypeMismatchException | _: DocumentUnreadable =>
+                    ExecutionResponse.whiskError(Messages.actionMismatchWhileInvoking)
+                  case e: Throwable =>
+                    logging.error(this, s"An unknown DB connection error occurred while fetching an action: $e.")
+                    ExecutionResponse.whiskError(Messages.actionFetchErrorWhileInvoking)
+                }
             val errMsg = s"Error to fetch action ${msg.action} for msg ${msg.activationId}, error is ${t.getMessage}"
             logging.error(this, errMsg)
 
@@ -1270,7 +1304,21 @@ class FunctionPullingContainerProxy(
 
     val actionTimeout = action.limits.timeout.duration
 
-    val (env, parameters) = ContainerProxy.partitionArguments(msg.content, msg.initArgs)
+    val targetDispatch =
+      if (action.exec.kind == TargetBindingProvider.ReusableConcurrencyKind) {
+        TargetBoundActivationContent.parseTargetDispatch(msg.content) match {
+          case Right(value) => Some(value)
+          case Left(error)  => throw new IllegalStateException(error.targetReencryptionError)
+        }
+      } else None
+
+    val (env, parameters) = targetDispatch match {
+      case Some(dispatch) =>
+        Map.empty[String, JsValue] -> JsObject(
+          "__reusable_protected_input_envelope" -> JsString(
+            Base64.getEncoder.encodeToString(dispatch.targetInput.bytes.toArray)))
+      case None => ContainerProxy.partitionArguments(msg.content, msg.initArgs)
+    }
 
     val environment = Map(
       "namespace" -> msg.user.namespace.name.toJson,
@@ -1282,27 +1330,56 @@ class FunctionPullingContainerProxy(
     // if the action requests the api key to be injected into the action context, add it here;
     // treat a missing annotation as requesting the api key for backward compatibility
     val authEnvironment = {
-      if (action.annotations.isTruthy(Annotations.ProvideApiKeyAnnotationName, valueForNonExistent = true)) {
+      if (targetDispatch.isEmpty &&
+          action.annotations.isTruthy(Annotations.ProvideApiKeyAnnotationName, valueForNonExistent = true)) {
         msg.user.authkey.toEnvironment.fields
       } else Map.empty
     }
 
+    val targetPreconditions: Future[Unit] = targetDispatch match {
+      case Some(dispatch) =>
+        val actualWarm = stateData.isInstanceOf[WarmData]
+        val activeBinding = activeTargetBinding.map(_._2.id)
+        if (dispatch.exactRevision != msg.revision || dispatch.exactRevision != action.rev) {
+          Future.failed(new IllegalStateException("target-bound action revision changed before execution"))
+        } else if (activeBinding != Some(dispatch.targetBindingId)) {
+          Future.failed(
+            new IllegalStateException("target-bound activation does not match the concrete container binding"))
+        } else if (dispatch.warmed != actualWarm) {
+          Future.failed(new IllegalStateException("target-bound warmed state does not match the concrete container"))
+        } else Future.successful(())
+      case None => Future.successful(())
+    }
+
     // Only initialize iff we haven't yet warmed the container
-    val initialize = stateData match {
-      case _: WarmData =>
-        Future.successful(None)
-      case _ =>
-        val owEnv = (authEnvironment ++ environment ++ Map(
-          "deadline" -> (Instant.now.toEpochMilli + actionTimeout.toMillis).toString.toJson)) map {
-          case (key, value) => "__OW_" + key.toUpperCase -> value
-        }
-        emitC1TimingEvent("OW500", "openwhisk_container_initialize_enter", msg)
-        container
-          .initialize(action.containerInitializer(env ++ owEnv), actionTimeout, action.limits.concurrency.maxConcurrent)
-          .andThen {
-            case _ => emitC1TimingEvent("OW510", "openwhisk_container_initialize_exit", msg)
+    val initialize = targetPreconditions.flatMap { _ =>
+      stateData match {
+        case _: WarmData =>
+          Future.successful(None)
+        case _ =>
+          val owEnv = (authEnvironment ++ environment ++ Map(
+            "deadline" -> (Instant.now.toEpochMilli + actionTimeout.toMillis).toString.toJson)) map {
+            case (key, value) => "__OW_" + key.toUpperCase -> value
           }
-          .map(Some(_))
+          emitC1TimingEvent("OW500", "openwhisk_container_initialize_enter", msg)
+          val initialization = targetDispatch match {
+            case Some(dispatch) =>
+              container.initializeTargetBound(
+                FunctionPullingContainerProxy.targetBoundInitializer(action, env ++ owEnv, dispatch),
+                actionTimeout,
+                action.limits.concurrency.maxConcurrent)
+            case None =>
+              container.initialize(
+                action.containerInitializer(env ++ owEnv),
+                actionTimeout,
+                action.limits.concurrency.maxConcurrent)
+          }
+          initialization
+            .andThen {
+              case _ => emitC1TimingEvent("OW510", "openwhisk_container_initialize_exit", msg)
+            }
+            .map(Some(_))
+      }
     }
 
     val activation: Future[WhiskActivation] = initialize
@@ -1344,14 +1421,26 @@ class FunctionPullingContainerProxy(
               isBackendPressureActivation(msg),
               action.exec.kind,
               (eventCode, boundaryName) => emitC1TimingEvent(eventCode, boundaryName, msg)) {
-              container.run(
-                parameters,
-                env.toJson.asJsObject,
-                actionTimeout,
-                action.limits.concurrency.maxConcurrent,
-                msg.user.limits.allowedMaxPayloadSize,
-                msg.user.limits.allowedTruncationSize,
-                resumeRun.isDefined)(msg.transid)
+              targetDispatch match {
+                case Some(_) =>
+                  container.runTargetBound(
+                    parameters,
+                    env.toJson.asJsObject,
+                    actionTimeout,
+                    action.limits.concurrency.maxConcurrent,
+                    msg.user.limits.allowedMaxPayloadSize,
+                    msg.user.limits.allowedTruncationSize,
+                    resumeRun.isDefined)(msg.transid)
+                case None =>
+                  container.run(
+                    parameters,
+                    env.toJson.asJsObject,
+                    actionTimeout,
+                    action.limits.concurrency.maxConcurrent,
+                    msg.user.limits.allowedMaxPayloadSize,
+                    msg.user.limits.allowedTruncationSize,
+                    resumeRun.isDefined)(msg.transid)
+              }
             }
           }
 
@@ -1361,13 +1450,16 @@ class FunctionPullingContainerProxy(
               val initRunInterval = initInterval
                 .map(i => Interval(runInterval.start.minusMillis(i.duration.toMillis), runInterval.end))
                 .getOrElse(runInterval)
+              val effectiveResponse = targetDispatch
+                .map(dispatch => FunctionPullingContainerProxy.targetBoundRuntimeResponse(dispatch, response))
+                .getOrElse(response)
               val whiskActivation = constructWhiskActivation(
                 action,
                 msg,
                 initInterval,
                 initRunInterval,
                 runInterval.duration >= actionTimeout,
-                response)
+                effectiveResponse)
               emitC1TimingEvent("N700", "native_worker_result_ready", msg)
               whiskActivation
           }
@@ -1534,6 +1626,87 @@ class FunctionPullingContainerProxy(
 }
 
 object FunctionPullingContainerProxy {
+  private val P2ResultEnvelopeField = "__reusable_protected_result_envelope"
+  private val P2RequestIdHashField = "__reusable_request_id_hash"
+  private val P2TargetBindingField = "__reusable_target_binding_id"
+
+  private[containerpool] def targetBoundInitializer(action: ExecutableWhiskAction,
+                                                    environment: Map[String, JsValue],
+                                                    dispatch: TargetBoundActivationContent.TargetDispatch): JsObject = {
+    val base = action.containerInitializer(environment)
+    JsObject(
+      base.fields ++ Map(
+        "code" -> JsString.empty,
+        "protected_code_envelope" -> JsString(Base64.getEncoder.encodeToString(dispatch.targetCode.get.bytes.toArray)),
+        "annotations" -> JsObject.empty))
+  }
+
+  private[containerpool] def targetBoundRuntimeResponse(dispatch: TargetBoundActivationContent.TargetDispatch,
+                                                        response: ExecutionResponse): ExecutionResponse = {
+    if (!response.isSuccess) {
+      response
+    } else {
+      val parsed = for {
+        outer <- response.result match {
+          case Some(value: JsObject) => Right(value)
+          case _                     => Left("protected runtime response is not an object")
+        }
+        runtimeSuccess <- outer.fields.get("success") match {
+          case Some(JsBoolean(value)) => Right(value)
+          case _                      => Left("protected runtime response is missing success")
+        }
+        statusCode <- outer.fields.get("status_code") match {
+          case Some(JsNumber(value)) if value.isValidInt => Right(value.toInt)
+          case _                                         => Left("protected runtime response is missing status_code")
+        }
+        _ <- Either.cond(runtimeSuccess && statusCode == 0, (), "protected runtime reported an application failure")
+        result <- outer.fields.get("result") match {
+          case Some(value: JsObject) => Right(value)
+          case _                     => Left("protected runtime result is not an object")
+        }
+        encodedEnvelope <- result.fields.get(P2ResultEnvelopeField) match {
+          case Some(JsString(value)) => Right(value)
+          case _                     => Left("protected runtime result is missing its T2G envelope")
+        }
+        envelopeBytes <- try Right(
+          org.apache.pekko.util.ByteString.fromArray(Base64.getDecoder.decode(encodedEnvelope)))
+        catch {
+          case _: IllegalArgumentException => Left("protected runtime result envelope is not base64")
+        }
+        envelope <- ProtectedEnvelopeV1.decode(envelopeBytes)
+        requestIdHash <- result.fields.get(P2RequestIdHashField) match {
+          case Some(JsString(value)) if value.matches("[0-9a-f]{64}") => Right(value)
+          case _                                                      => Left("protected runtime result has an invalid request correlation")
+        }
+        targetBindingId <- result.fields.get(P2TargetBindingField) match {
+          case Some(JsNumber(value)) if value.isValidLong => Right(value.toLong)
+          case Some(JsString(value)) =>
+            try Right(value.toLong)
+            catch { case _: NumberFormatException => Left("protected runtime result has an invalid target binding") }
+          case _ => Left("protected runtime result is missing its target binding")
+        }
+        expectedRequestIdHash = dispatch.targetInput.correlationHash.map(byte => f"${byte & 0xff}%02x").mkString
+        _ <- Either.cond(
+          targetBindingId == dispatch.targetBindingId &&
+            envelope.bindingId == dispatch.targetBindingId &&
+            envelope.kind == ProtectedObjectKind.Result &&
+            envelope.direction == ProtectedEnvelopeDirection.TargetToGateway &&
+            requestIdHash == expectedRequestIdHash &&
+            envelope.correlationHash == dispatch.targetInput.correlationHash,
+          (),
+          "protected runtime result does not match its target/request correlation")
+      } yield
+        TargetBoundActivationContent.targetResult(
+          TargetBoundActivationContent
+            .TargetResult(dispatch.sourceBindingId, dispatch.targetBindingId, requestIdHash, envelope))
+
+      parsed match {
+        case Right(result) => ExecutionResponse.success(Some(result))
+        case Left(message) => ExecutionResponse.whiskError(message)
+      }
+    }
+  }
+
   private[containerpool] def withC1NativeBackendPressureExecutionBoundaries[T](
     markedBackendPressure: Boolean,
     actionKind: String,

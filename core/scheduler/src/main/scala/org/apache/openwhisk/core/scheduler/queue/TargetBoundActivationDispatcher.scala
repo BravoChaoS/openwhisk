@@ -211,6 +211,21 @@ object TargetBoundActivationContent {
   val ExactRevisionField = "exactActionRevision"
   val WarmedField = "warmed"
   val WorkerCodeFetchField = "workerCodeFetch"
+  val ResultRootField = "__ow_reusable_target_result_v1"
+  val TargetResultField = "targetProtectedResultEnvelope"
+  val RequestIdHashField = "requestIdHash"
+
+  final case class TargetDispatch(targetBindingId: Long,
+                                  sourceBindingId: Long,
+                                  exactRevision: DocRevision,
+                                  warmed: Boolean,
+                                  targetInput: ProtectedEnvelopeV1,
+                                  targetCode: Option[ProtectedEnvelopeV1])
+
+  final case class TargetResult(sourceBindingId: Long,
+                                targetBindingId: Long,
+                                requestIdHash: String,
+                                targetEnvelope: ProtectedEnvelopeV1)
 
   def sourceInput(content: Option[JsValue]): Either[TargetReencryptionError, ProtectedEnvelopeV1] =
     for {
@@ -255,6 +270,145 @@ object TargetBoundActivationContent {
       TargetCodeField -> JsString(encodeBase64(code.bytes))
     }
     JsObject(RootField -> JsObject(fields))
+  }
+
+  def parseTargetDispatch(content: Option[JsValue]): Either[TargetReencryptionError, TargetDispatch] =
+    for {
+      root <- singleRoot(content, RootField, "target-bound dispatch")
+      targetBindingId <- positiveLong(root, TargetBindingField)
+      sourceBindingId <- positiveLong(root, SourceBindingField)
+      exactRevision <- root.fields.get(ExactRevisionField) match {
+        case Some(JsString(value)) if value.nonEmpty => Right(DocRevision(value))
+        case _                                       => Left(TargetReencryptionError("target-bound dispatch is missing its exact action revision"))
+      }
+      warmed <- root.fields.get(WarmedField) match {
+        case Some(JsBoolean(value)) => Right(value)
+        case _                      => Left(TargetReencryptionError("target-bound dispatch is missing warmed state"))
+      }
+      _ <- root.fields.get(WorkerCodeFetchField) match {
+        case Some(JsBoolean(false)) => Right(())
+        case _                      => Left(TargetReencryptionError("target-bound dispatch must disable worker code fetch"))
+      }
+      input <- decodeEnvelope(root, TargetInputField, "target-protected INPUT")
+      _ <- requireTargetEnvelope(input, ProtectedObjectKind.Input, targetBindingId, "target-protected INPUT")
+      code <- root.fields.get(TargetCodeField) match {
+        case Some(_) => decodeEnvelope(root, TargetCodeField, "target-protected CODE").map(Some(_))
+        case None    => Right(None)
+      }
+      _ <- code match {
+        case Some(envelope) =>
+          requireTargetEnvelope(envelope, ProtectedObjectKind.Code, targetBindingId, "target-protected CODE")
+        case None => Right(())
+      }
+      expectedFields = Set(
+        TargetBindingField,
+        SourceBindingField,
+        ExactRevisionField,
+        WarmedField,
+        WorkerCodeFetchField,
+        TargetInputField) ++ code.map(_ => TargetCodeField)
+      _ <- Either.cond(
+        root.fields.keySet == expectedFields,
+        (),
+        TargetReencryptionError("target-bound dispatch contains unexpected fields"))
+      _ <- Either.cond(
+        warmed == code.isEmpty,
+        (),
+        TargetReencryptionError("cold target-bound dispatch requires CODE and warm dispatch must omit it"))
+    } yield TargetDispatch(targetBindingId, sourceBindingId, exactRevision, warmed, input, code)
+
+  def targetResult(result: TargetResult): JsObject =
+    JsObject(
+      ResultRootField -> JsObject(
+        SourceBindingField -> JsString(result.sourceBindingId.toString),
+        TargetBindingField -> JsString(result.targetBindingId.toString),
+        RequestIdHashField -> JsString(result.requestIdHash),
+        TargetResultField -> JsString(encodeBase64(result.targetEnvelope.bytes))))
+
+  def parseTargetResult(result: Option[JsValue]): Either[TargetReencryptionError, TargetResult] =
+    for {
+      root <- singleRoot(result, ResultRootField, "target-bound result")
+      _ <- Either.cond(
+        root.fields.keySet == Set(SourceBindingField, TargetBindingField, RequestIdHashField, TargetResultField),
+        (),
+        TargetReencryptionError("target-bound result contains unexpected fields"))
+      sourceBindingId <- positiveLong(root, SourceBindingField)
+      targetBindingId <- positiveLong(root, TargetBindingField)
+      requestIdHash <- root.fields.get(RequestIdHashField) match {
+        case Some(JsString(value)) if value.matches("[0-9a-f]{64}") => Right(value)
+        case _                                                      => Left(TargetReencryptionError("target-bound result has an invalid request id hash"))
+      }
+      envelope <- decodeEnvelope(root, TargetResultField, "target-protected RESULT")
+      _ <- requireTargetEnvelope(envelope, ProtectedObjectKind.Result, targetBindingId, "target-protected RESULT")
+      _ <- Either.cond(
+        envelope.correlationHash.map(byte => f"${byte & 0xff}%02x").mkString == requestIdHash,
+        (),
+        TargetReencryptionError("target-bound result request correlation does not match its envelope"))
+    } yield TargetResult(sourceBindingId, targetBindingId, requestIdHash, envelope)
+
+  private def singleRoot(content: Option[JsValue],
+                         field: String,
+                         description: String): Either[TargetReencryptionError, JsObject] =
+    content match {
+      case Some(JsObject(fields)) if fields.keySet == Set(field) =>
+        fields(field) match {
+          case value: JsObject => Right(value)
+          case _               => Left(TargetReencryptionError(s"$description root must be an object"))
+        }
+      case _ => Left(TargetReencryptionError(s"$description must contain only its protected root"))
+    }
+
+  private def positiveLong(root: JsObject, field: String): Either[TargetReencryptionError, Long] =
+    root.fields.get(field) match {
+      case Some(JsString(value)) =>
+        try {
+          val parsed = value.toLong
+          Either.cond(parsed > 0, parsed, TargetReencryptionError(s"$field must be positive"))
+        } catch {
+          case _: NumberFormatException => Left(TargetReencryptionError(s"$field must be a decimal integer"))
+        }
+      case _ => Left(TargetReencryptionError(s"$field is missing"))
+    }
+
+  private def decodeEnvelope(root: JsObject,
+                             field: String,
+                             description: String): Either[TargetReencryptionError, ProtectedEnvelopeV1] =
+    for {
+      encoded <- root.fields.get(field) match {
+        case Some(JsString(value)) => Right(value)
+        case _                     => Left(TargetReencryptionError(s"$description is missing"))
+      }
+      bytes <- decodeBase64(encoded, description)
+      envelope <- ProtectedEnvelopeV1
+        .decode(bytes)
+        .left
+        .map(message => TargetReencryptionError(s"invalid $description: $message"))
+    } yield envelope
+
+  private def requireTargetEnvelope(envelope: ProtectedEnvelopeV1,
+                                    kind: ProtectedObjectKind,
+                                    targetBindingId: Long,
+                                    description: String): Either[TargetReencryptionError, Unit] = {
+    val expectedDirection =
+      if (kind == ProtectedObjectKind.Result) ProtectedEnvelopeDirection.TargetToGateway
+      else ProtectedEnvelopeDirection.GatewayToTarget
+    for {
+      _ <- Either.cond(
+        envelope.direction == expectedDirection,
+        (),
+        TargetReencryptionError(s"$description has the wrong direction"))
+      _ <- Either.cond(envelope.kind == kind, (), TargetReencryptionError(s"$description has the wrong object kind"))
+      _ <- Either.cond(
+        envelope.bindingId == targetBindingId,
+        (),
+        TargetReencryptionError(s"$description has the wrong target binding"))
+      _ <- Either.cond(
+        envelope.correlationKind ==
+          (if (kind == ProtectedObjectKind.Code) ProtectedCorrelationKind.CodeObject
+           else ProtectedCorrelationKind.RequestId),
+        (),
+        TargetReencryptionError(s"$description has the wrong correlation kind"))
+    } yield ()
   }
 
   private[queue] def requireEnvelope(envelope: ProtectedEnvelopeV1,

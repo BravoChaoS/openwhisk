@@ -61,6 +61,11 @@ class TargetBoundActivationDispatcherTests extends AnyFlatSpec with Matchers {
     contract.fields(TargetBoundActivationContent.WorkerCodeFetchField) shouldBe JsBoolean(false)
     decodeTarget(contract, TargetBoundActivationContent.TargetCodeField).kind shouldBe ProtectedObjectKind.Code
     decodeTarget(contract, TargetBoundActivationContent.TargetInputField).kind shouldBe ProtectedObjectKind.Input
+    val parsed = TargetBoundActivationContent.parseTargetDispatch(result.content).toOption.get
+    parsed.targetBindingId shouldBe 42
+    parsed.sourceBindingId shouldBe 17
+    parsed.warmed shouldBe false
+    parsed.targetCode.map(_.kind) shouldBe Some(ProtectedObjectKind.Code)
   }
 
   it should "return only target INPUT for a warm pull without loading action code" in {
