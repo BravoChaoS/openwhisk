@@ -280,8 +280,8 @@ final class P1GatewayControlClient(config: GatewayControlConfig)(implicit ec: Ex
       fail(GatewayControlProtocolError("Gateway target registration did not return ACTIVE"))
     }
     if (status != 0) fail(GatewayControlRejected(status))
-    if (targetBindingId <= 0 || peerSessionId <= 0) {
-      fail(GatewayControlProtocolError("Gateway target registration returned invalid identifiers"))
+    if (targetBindingId <= 0) {
+      fail(GatewayControlProtocolError("Gateway target registration returned an invalid target binding id"))
     }
     GatewayRegisteredTarget(targetBindingId, peerSessionId)
   }

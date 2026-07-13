@@ -131,7 +131,7 @@ class GatewayControlClientTests extends AnyFlatSpec with Matchers {
           new String(host.takeWhile(_ != 0), "UTF-8") shouldBe "172.18.89.215"
 
           val responseBody = ByteBuffer.allocate(20).order(ByteOrder.BIG_ENDIAN)
-          responseBody.put(1.toByte).put(2.toByte).putShort(0).putInt(0).putLong(41).putInt(7)
+          responseBody.put(1.toByte).put(2.toByte).putShort(0).putInt(0).putLong(41).putInt(0)
           writeResponse(
             register,
             P1GatewayControlClient.RegisterTargetResponseType,
@@ -156,7 +156,7 @@ class GatewayControlClientTests extends AnyFlatSpec with Matchers {
 
       val client = new P1GatewayControlClient(config(server.getLocalPort))
       Await.result(client.registerTarget("container-1", "172.18.89.215", 18888), 5.seconds) shouldBe
-        Right(GatewayRegisteredTarget(41, 7))
+        Right(GatewayRegisteredTarget(41, 0))
       Await.result(client.closeTarget(41), 5.seconds) shouldBe Right(())
       Await.result(observed, 5.seconds)
     }
