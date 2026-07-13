@@ -71,7 +71,7 @@ class ContainerMessageConsumer(
         val createContainer = for {
           identity <- Identity.get(authStore, EntityName(creation.invocationNamespace))
           action <- if (creation.whiskActionMetaData.exec.kind == TargetBindingProvider.ReusableConcurrencyKind) {
-            ContainerMessageConsumer.metadataOnlyAction(creation.whiskActionMetaData) match {
+            ContainerMessageConsumer.metadataOnlyAction(creation.whiskActionMetaData, creation.revision) match {
               case Right(value)  => Future.successful(value)
               case Left(message) => Future.failed(new IllegalStateException(message))
             }
@@ -147,7 +147,8 @@ class ContainerMessageConsumer(
 }
 
 object ContainerMessageConsumer {
-  private[invoker] def metadataOnlyAction(metadata: WhiskActionMetaData): Either[String, WhiskAction] = {
+  private[invoker] def metadataOnlyAction(metadata: WhiskActionMetaData,
+                                          exactRevision: DocRevision): Either[String, WhiskAction] = {
     val executable = metadata.exec match {
       case exec: CodeExecMetaDataAsString =>
         Right(CodeExecAsAttachment(exec.manifest, Inline(""), exec.entryPoint, exec.binary))
@@ -165,7 +166,7 @@ object ContainerMessageConsumer {
         metadata.version,
         metadata.publish,
         metadata.annotations,
-        metadata.updated).revision[WhiskAction](metadata.rev)
+        metadata.updated).revision[WhiskAction](exactRevision)
     }
   }
 }

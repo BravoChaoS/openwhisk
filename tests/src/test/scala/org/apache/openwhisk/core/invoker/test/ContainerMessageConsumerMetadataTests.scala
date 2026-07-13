@@ -36,9 +36,9 @@ class ContainerMessageConsumerMetadataTests extends AnyFlatSpec with Matchers {
       EntityPath("namespace"),
       EntityName("protected"),
       CodeExecMetaDataAsString(manifest, binary = true, entryPoint = Some("main")),
-      limits = ActionLimits(memory = MemoryLimit(256.MB))).revision[WhiskActionMetaData](revision)
+      limits = ActionLimits(memory = MemoryLimit(256.MB)))
 
-    val action = ContainerMessageConsumer.metadataOnlyAction(metadata).toOption.get
+    val action = ContainerMessageConsumer.metadataOnlyAction(metadata, revision).toOption.get
     val actionExec = action.exec.asInstanceOf[CodeExecAsAttachment]
     action.rev shouldBe revision
     actionExec.kind shouldBe "reusable-concurrency:1"
