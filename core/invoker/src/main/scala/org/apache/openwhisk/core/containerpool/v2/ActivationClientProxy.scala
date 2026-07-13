@@ -28,7 +28,14 @@ import org.apache.openwhisk.core.containerpool.ContainerId
 import org.apache.openwhisk.core.entity._
 import org.apache.openwhisk.core.scheduler.SchedulerEndpoints
 import org.apache.openwhisk.core.scheduler.grpc.ActivationResponse
-import org.apache.openwhisk.core.scheduler.queue.{ActionMismatch, MemoryQueueError, NoActivationMessage, NoMemoryQueue}
+import org.apache.openwhisk.core.scheduler.queue.{
+  ActionMismatch,
+  MemoryQueueError,
+  NoActivationMessage,
+  NoMemoryQueue,
+  TargetBindingError,
+  TargetReencryptionError
+}
 import org.apache.openwhisk.grpc.{ActivationServiceClient, FetchRequest, RescheduleRequest, RescheduleResponse}
 import spray.json.JsonParser.ParsingException
 
@@ -71,9 +78,8 @@ class ActivationClientProxy(
   schedulerHost: String,
   rpcPort: Int,
   containerId: ContainerId,
-  activationClientFactory: (String, FullyQualifiedEntityName, String, Int, Boolean) => Future[ActivationServiceClient])(
-  implicit actorSystem: ActorSystem,
-  logging: Logging)
+  activationClientFactory: (String, FullyQualifiedEntityName, String, Int, Boolean) => Future[ActivationServiceClient],
+  targetBindingId: Option[Long] = None)(implicit actorSystem: ActorSystem, logging: Logging)
     extends FSM[ActivationClientProxyState, ActivationClientProxyData]
     with Stash {
 
@@ -206,6 +212,13 @@ class ActivationClientProxy(
           context.parent ! RetryRequestActivation
 
           stay()
+
+        case e @ (_: TargetBindingError | _: TargetReencryptionError) =>
+          val errorMsg = s"[${containerId.asString}] target-bound activation fetch failed: ${e.causedBy}"
+          logging.error(this, errorMsg)
+          context.parent ! FailureMessage(new RuntimeException(errorMsg))
+          safelyCloseClient(c)
+          goto(ClientProxyRemoving)
       }
 
     /**
@@ -347,16 +360,16 @@ class ActivationClientProxy(
   private def safelyCloseClient(client: Client): Unit = {
     Try {
       client.activationClient
-        .fetchActivation(
-          FetchRequest(
-            TransactionId(TransactionId.generateTid()).serialize,
-            invocationNamespace,
-            action.serialize,
-            rev.serialize,
-            containerId.asString,
-            warmed,
-            None,
-            false))
+        .fetchActivation(FetchRequest(
+          TransactionId(TransactionId.generateTid()).serialize,
+          invocationNamespace,
+          action.serialize,
+          rev.serialize,
+          containerId.asString,
+          warmed,
+          None,
+          false,
+          targetBindingId))
         .andThen {
           case _ =>
             client.activationClient.close().andThen {
@@ -382,16 +395,16 @@ class ActivationClientProxy(
                                        lastDuration: Option[Long] = None) = {
     Try {
       client
-        .fetchActivation(
-          FetchRequest(
-            TransactionId(TransactionId.generateTid()).serialize,
-            invocationNamespace,
-            fqn.serialize,
-            rev.serialize,
-            containerId.asString,
-            warmed,
-            lastDuration,
-            true))
+        .fetchActivation(FetchRequest(
+          TransactionId(TransactionId.generateTid()).serialize,
+          invocationNamespace,
+          fqn.serialize,
+          rev.serialize,
+          containerId.asString,
+          warmed,
+          lastDuration,
+          true,
+          targetBindingId))
         .flatMap { r =>
           Future(ActivationResponse.parse(r.activationMessage))
             .flatMap(Future.fromTry)
@@ -446,12 +459,12 @@ object ActivationClientProxy {
             schedulerHost: String,
             rpcPort: Int,
             containerId: ContainerId,
-            activationClientFactory: (
-              String,
-              FullyQualifiedEntityName,
-              String,
-              Int,
-              Boolean) => Future[ActivationServiceClient])(implicit actorSystem: ActorSystem, logging: Logging) = {
+            activationClientFactory: (String,
+                                      FullyQualifiedEntityName,
+                                      String,
+                                      Int,
+                                      Boolean) => Future[ActivationServiceClient],
+            targetBindingId: Option[Long] = None)(implicit actorSystem: ActorSystem, logging: Logging) = {
     Props(
       new ActivationClientProxy(
         invocationNamespace,
@@ -460,7 +473,8 @@ object ActivationClientProxy {
         schedulerHost,
         rpcPort,
         containerId,
-        activationClientFactory))
+        activationClientFactory,
+        targetBindingId))
   }
 }
 

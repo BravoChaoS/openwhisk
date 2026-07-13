@@ -187,7 +187,8 @@ class FPCInvokerReactive(config: WhiskConfig,
                                             rev: DocRevision,
                                             schedulerHost: String,
                                             rpcPort: Int,
-                                            containerId: ContainerId): ActorRef =
+                                            containerId: ContainerId,
+                                            targetBindingId: Option[Long]): ActorRef =
     f.actorOf(Props(HealthActivationServiceClient()))
 
   private def healthContainerProxyFactory(f: ActorRefFactory, healthManger: ActorRef): ActorRef = {
@@ -322,11 +323,20 @@ class FPCInvokerReactive(config: WhiskConfig,
                                  rev: DocRevision,
                                  schedulerHost: String,
                                  rpcPort: Int,
-                                 containerId: ContainerId): ActorRef = {
+                                 containerId: ContainerId,
+                                 targetBindingId: Option[Long]): ActorRef = {
     implicit val transId = TransactionId.invokerNanny
     f.actorOf(
       ActivationClientProxy
-        .props(invocationNamespace, fqn, rev, schedulerHost, rpcPort, containerId, activationClientFactory(etcdClient)))
+        .props(
+          invocationNamespace,
+          fqn,
+          rev,
+          schedulerHost,
+          rpcPort,
+          containerId,
+          activationClientFactory(etcdClient),
+          targetBindingId))
   }
 
   val prewarmingConfigs: List[PrewarmingConfig] = {

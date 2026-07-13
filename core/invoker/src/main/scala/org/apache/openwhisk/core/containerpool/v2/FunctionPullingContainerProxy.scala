@@ -66,6 +66,12 @@ import scala.util.{Failure, Success, Try}
 case class RunActivation(action: ExecutableWhiskAction, msg: ActivationMessage)
 case class RunActivationCompleted(container: Container, action: ExecutableWhiskAction, duration: Option[Long])
 case class InitCodeCompleted(data: WarmData)
+private[v2] case class PreWarmContainerReady(data: PreWarmData, binding: Option[(TargetContainer, TargetBinding)])
+private[v2] case class ColdContainerReady(job: Initialize,
+                                          container: Container,
+                                          binding: Option[(TargetContainer, TargetBinding)])
+private[v2] case object TargetBoundContainerRemovalCompleted
+private[v2] case class TargetBoundContainerRemovalFailed(cause: Throwable)
 
 // Events received by the actor
 case class Initialize(invocationNamespace: String,
@@ -199,7 +205,8 @@ class FunctionPullingContainerProxy(
                        DocRevision,
                        String,
                        Int,
-                       ContainerId) => ActorRef,
+                       ContainerId,
+                       Option[Long]) => ActorRef,
   sendActiveAck: ActiveAck,
   storeActivation: (TransactionId, WhiskActivation, Boolean, UserContext) => Future[Any],
   collectLogs: LogsCollector,
@@ -210,7 +217,9 @@ class FunctionPullingContainerProxy(
   poolConfig: ContainerPoolConfig,
   timeoutConfig: ContainerProxyTimeoutConfig,
   healtCheckConfig: ContainerProxyHealthCheckConfig,
-  testTcp: Option[ActorRef])(implicit actorSystem: ActorSystem, logging: Logging)
+  testTcp: Option[ActorRef],
+  targetBindingProvider: TargetBindingProvider = TargetBindingProvider.Disabled)(implicit actorSystem: ActorSystem,
+                                                                                 logging: Logging)
     extends FSM[ProxyState, Data]
     with Stash {
   startWith(Uninitialized, NonexistentData())
@@ -227,6 +236,9 @@ class FunctionPullingContainerProxy(
   private val PingCacheName = "PingCache"
   private val pingCacheInterval = 1.minute
   private var timedOut = false
+  private var activeTargetBinding = Option.empty[(TargetContainer, TargetBinding)]
+  private var targetBoundRemovalStarted = false
+  private var pendingTargetBoundRemoval = Option.empty[(Container, Boolean)]
   private val c1TimingProcessId = ManagementFactory.getRuntimeMXBean.getName.takeWhile(_ != '@')
   private val c1TimingNode = sys.env.get("C1_TIMING_NODE_ID").orElse(sys.env.get("HOSTNAME")).getOrElse("")
   private val c1InternalRescheduleInjectionReason = "c1_internal_reschedule_injection"
@@ -251,12 +263,11 @@ class FunctionPullingContainerProxy(
   private def shouldSkipBackendPressureActivationStore(msg: ActivationMessage): Boolean =
     sys.env.get("C1_BACKEND_PRESSURE_SKIP_ACTIVATION_STORE").contains("1") && isBackendPressureActivation(msg)
 
-  private def guardedStoreActivation(
-    tid: TransactionId,
-    activation: WhiskActivation,
-    msg: ActivationMessage,
-    isBlocking: Boolean,
-    context: UserContext): Future[Any] = {
+  private def guardedStoreActivation(tid: TransactionId,
+                                     activation: WhiskActivation,
+                                     msg: ActivationMessage,
+                                     isBlocking: Boolean,
+                                     context: UserContext): Future[Any] = {
     if (shouldSkipBackendPressureActivationStore(msg)) {
       val fields = Seq(
         c1TimingField("activation_id", msg.activationId.asString),
@@ -298,13 +309,27 @@ class FunctionPullingContainerProxy(
               c1TimingField("workload_id", c1BackendPressureResultField(resultFields, "workload_id").getOrElse("")),
               c1TimingField("workload_kind", c1BackendPressureResultField(resultFields, "workload_kind").getOrElse("")),
               c1TimingField("workload_duration_ns", workloadDurationNs.get),
-              c1TimingField("compress_mode", c1BackendPressureResultField(resultFields, "workload_compress_mode").getOrElse("")),
-              c1TimingField("compress_bytes", c1BackendPressureResultField(resultFields, "workload_compress_bytes").getOrElse("")),
-              c1TimingField("compress_level", c1BackendPressureResultField(resultFields, "workload_compress_level").getOrElse("")),
-              c1TimingField("output_bytes", c1BackendPressureResultField(resultFields, "workload_output_bytes").getOrElse("")),
-              c1TimingField("failure_probability", c1BackendPressureResultField(resultFields, "failure_probability").getOrElse("")),
-              c1TimingField("scheduled_failure", c1BackendPressureResultField(resultFields, "scheduled_failure").getOrElse("")),
-              c1TimingField("failure_reason", c1BackendPressureResultField(resultFields, "failure_reason").getOrElse("")))
+              c1TimingField(
+                "compress_mode",
+                c1BackendPressureResultField(resultFields, "workload_compress_mode").getOrElse("")),
+              c1TimingField(
+                "compress_bytes",
+                c1BackendPressureResultField(resultFields, "workload_compress_bytes").getOrElse("")),
+              c1TimingField(
+                "compress_level",
+                c1BackendPressureResultField(resultFields, "workload_compress_level").getOrElse("")),
+              c1TimingField(
+                "output_bytes",
+                c1BackendPressureResultField(resultFields, "workload_output_bytes").getOrElse("")),
+              c1TimingField(
+                "failure_probability",
+                c1BackendPressureResultField(resultFields, "failure_probability").getOrElse("")),
+              c1TimingField(
+                "scheduled_failure",
+                c1BackendPressureResultField(resultFields, "scheduled_failure").getOrElse("")),
+              c1TimingField(
+                "failure_reason",
+                c1BackendPressureResultField(resultFields, "failure_reason").getOrElse("")))
             logging.info(this, s"C1_BACKEND_PRESSURE_WORKLOAD_TIMING|${markerFields.mkString("|")}")(msg.transid)
           }
         case _ =>
@@ -355,6 +380,43 @@ class FunctionPullingContainerProxy(
       case _ => msg
     }
 
+  private def awaitTargetBinding(container: Container,
+                                 kind: String): Future[Option[(TargetContainer, TargetBinding)]] = {
+    if (targetBindingProvider.requiresBinding(kind)) {
+      val target = TargetContainer(container.containerId, container.addr, kind)
+      targetBindingProvider.awaitReady(target).map(binding => Some(target -> binding))
+    } else {
+      Future.successful(None)
+    }
+  }
+
+  private def awaitTargetBindingOrDestroy(container: Container,
+                                          kind: String): Future[Option[(TargetContainer, TargetBinding)]] =
+    awaitTargetBinding(container, kind).recoverWith {
+      case t =>
+        logging.error(this, s"target binding readiness failed for ${container.containerId.asString}: ${t.getMessage}")
+        destroyContainer(container).transformWith(_ => Future.failed(t))
+    }
+
+  private def createActivationClient(job: Initialize,
+                                     container: Container): Either[ClientCreationFailed, InitializedData] =
+    Try(
+      clientProxyFactory(
+        context,
+        job.invocationNamespace,
+        job.fqn,
+        job.action.rev,
+        job.schedulerHost,
+        job.rpcPort,
+        container.containerId,
+        activeTargetBinding.map(_._2.id))) match {
+      case Success(clientProxy) =>
+        Right(InitializedData(container, job.invocationNamespace, job.action, clientProxy))
+      case Failure(t) =>
+        logging.error(this, s"failed to create activation client for ${job.action} caused by: $t")
+        Left(ClientCreationFailed(t, container, job.invocationNamespace, job.action))
+    }
+
   when(Uninitialized) {
     // pre warm a container (creates a stem cell container)
     case Event(job: Start, _) =>
@@ -367,7 +429,13 @@ class FunctionPullingContainerProxy(
         poolConfig.cpuShare(job.memoryLimit),
         poolConfig.cpuLimit(job.memoryLimit),
         None)
-        .map(container => PreWarmData(container, job.exec.kind, job.memoryLimit, expires = job.ttl.map(_.fromNow)))
+        .flatMap { container =>
+          awaitTargetBindingOrDestroy(container, job.exec.kind).map { binding =>
+            PreWarmContainerReady(
+              PreWarmData(container, job.exec.kind, job.memoryLimit, expires = job.ttl.map(_.fromNow)),
+              binding)
+          }
+        }
         .pipeTo(self)
       goto(CreatingContainer)
 
@@ -386,23 +454,10 @@ class FunctionPullingContainerProxy(
           case Failure(t) =>
             context.parent ! ContainerCreationFailed(t)
         }
-        .map { container =>
+        .flatMap { container =>
           logging.debug(this, s"a container ${container.containerId} is created for ${job.action}")
-          // create a client
-          Try(
-            clientProxyFactory(
-              context,
-              job.invocationNamespace,
-              job.fqn, // include binding field
-              job.action.rev,
-              job.schedulerHost,
-              job.rpcPort,
-              container.containerId)) match {
-            case Success(clientProxy) =>
-              InitializedData(container, job.invocationNamespace, job.action, clientProxy)
-            case Failure(t) =>
-              logging.error(this, s"failed to create activation client caused by: $t")
-              ClientCreationFailed(t, container, job.invocationNamespace, job.action)
+          awaitTargetBindingOrDestroy(container, job.action.exec.kind).map { binding =>
+            ColdContainerReady(job, container, binding)
           }
         }
         .pipeTo(self)
@@ -414,9 +469,10 @@ class FunctionPullingContainerProxy(
 
   when(CreatingContainer) {
     // container was successfully obtained
-    case Event(completed: PreWarmData, _: NonexistentData) =>
-      context.parent ! ReadyToWork(completed)
-      goto(ContainerCreated) using completed
+    case Event(completed: PreWarmContainerReady, _: NonexistentData) =>
+      activeTargetBinding = completed.binding
+      context.parent ! ReadyToWork(completed.data)
+      goto(ContainerCreated) using completed.data
 
     // container creation failed
     case Event(t: FailureMessage, _: NonexistentData) =>
@@ -429,23 +485,7 @@ class FunctionPullingContainerProxy(
   // prewarmed state, container created
   when(ContainerCreated) {
     case Event(job: Initialize, data: PreWarmData) =>
-      val res = Try(
-        clientProxyFactory(
-          context,
-          job.invocationNamespace,
-          job.fqn, // include binding field
-          job.action.rev,
-          job.schedulerHost,
-          job.rpcPort,
-          data.container.containerId)) match {
-        case Success(proxy) =>
-          InitializedData(data.container, job.invocationNamespace, job.action, proxy)
-        case Failure(t) =>
-          logging.error(this, s"failed to create activation client for ${job.action} caused by: $t")
-          ClientCreationFailed(t, data.container, job.invocationNamespace, job.action)
-      }
-
-      self ! res
+      createActivationClient(job, data.container).fold(self ! _, self ! _)
 
       goto(CreatingClient)
 
@@ -461,6 +501,11 @@ class FunctionPullingContainerProxy(
   }
 
   when(CreatingClient) {
+    case Event(ready: ColdContainerReady, _) =>
+      activeTargetBinding = ready.binding
+      createActivationClient(ready.job, ready.container).fold(self ! _, self ! _)
+      stay()
+
     // wait for client creation when cold start
     case Event(job: InitializedData, _) =>
       job.clientProxy ! StartClient
@@ -894,7 +939,22 @@ class FunctionPullingContainerProxy(
 
   when(Removing, unusedTimeout) {
     // only if ClientProxy is closed, ContainerProxy stops. So it is important for ClientProxy to send ClientClosed.
-    case Event(ClientClosed, _) =>
+    case Event(ClientClosed, _) if activeTargetBinding.isDefined && !runningActivations.isEmpty =>
+      logging.info(this, s"waiting for ${runningActivations.size()} activation(s) before closing target binding")
+      startSingleTimer(RunningActivationTimeoutName, ClientClosed, runningActivationTimeout)
+      stay()
+
+    case Event(ClientClosed, _) if activeTargetBinding.isDefined =>
+      beginTargetBoundRemoval()
+      stay()
+
+    case Event(ClientClosed, _) => stop()
+
+    case Event(TargetBoundContainerRemovalCompleted, _) => stop()
+
+    case Event(TargetBoundContainerRemovalFailed(cause), _) =>
+      logging.error(this, s"target binding close failed during container removal: ${cause.getMessage}")
+      invokerHealthManager ! HealthMessage(state = false)
       stop()
 
     // even if any error occurs, it still waits for ClientClosed event in order to be stopped after the client is closed.
@@ -993,21 +1053,50 @@ class FunctionPullingContainerProxy(
 
   private def cleanUp(container: Container, clientProxy: Option[ActorRef], replacePrewarm: Boolean = true): State = {
     context.parent ! ContainerRemoved(replacePrewarm)
-    val unpause = stateName match {
-      case Paused => container.resume()(TransactionId.invokerNanny)
-      case _      => Future.successful(())
-    }
-    unpause.andThen {
-      case Success(_) => destroyContainer(container)
-      case Failure(t) =>
-        // docker may hang when try to remove a paused container, so we shouldn't remove it
-        logging.error(this, s"Failed to resume container ${container.containerId}, error: $t")
+    if (activeTargetBinding.isDefined) {
+      pendingTargetBoundRemoval = Some(container -> (stateName == Paused))
+    } else {
+      val unpause = stateName match {
+        case Paused => container.resume()(TransactionId.invokerNanny)
+        case _      => Future.successful(())
+      }
+      unpause.andThen {
+        case Success(_) => destroyContainer(container)
+        case Failure(t) =>
+          // docker may hang when try to remove a paused container, so we shouldn't remove it
+          logging.error(this, s"Failed to resume container ${container.containerId}, error: $t")
+      }
     }
     clientProxy match {
       case Some(clientProxy) => clientProxy ! StopClientProxy
       case None              => self ! ClientClosed
     }
     gotoIfNotThere(Removing)
+  }
+
+  private def beginTargetBoundRemoval(): Unit = {
+    if (!targetBoundRemovalStarted) {
+      (pendingTargetBoundRemoval, activeTargetBinding) match {
+        case (Some((container, wasPaused)), Some((target, binding))) =>
+          targetBoundRemovalStarted = true
+          val unpause =
+            if (wasPaused) container.resume()(TransactionId.invokerNanny)
+            else Future.successful(())
+          unpause
+            .flatMap(_ => targetBindingProvider.closeBinding(target, binding))
+            .transformWith {
+              case Success(_) => destroyContainer(container)
+              case Failure(closeFailure) =>
+                destroyContainer(container).transform(_ => Failure(closeFailure))
+            }
+            .map(_ => TargetBoundContainerRemovalCompleted)
+            .recover { case t => TargetBoundContainerRemovalFailed(t) }
+            .pipeTo(self)
+        case _ =>
+          self ! TargetBoundContainerRemovalFailed(
+            new IllegalStateException("target-bound removal state is incomplete"))
+      }
+    }
   }
 
   /**
@@ -1236,7 +1325,7 @@ class FunctionPullingContainerProxy(
 
         val activationId = msg.activationId.asString
         val injectInternalReschedule =
-            c1InternalRescheduleInjectionEnabled &&
+          c1InternalRescheduleInjectionEnabled &&
             resumeRun.isDefined &&
             c1InternalRescheduleRequested(parameters) &&
             (FunctionPullingContainerProxy.c1InternalRescheduleInjectedActivations
@@ -1246,7 +1335,8 @@ class FunctionPullingContainerProxy(
           if (injectInternalReschedule) {
             logging.warn(
               this,
-              s"C1_INTERNAL_RESCHEDULE_INJECTION|activation_id=${c1TimingSanitize(activationId)}|container_id=${c1TimingSanitize(container.containerId.asString)}|reason=$c1InternalRescheduleInjectionReason|status=injected_once")(
+              s"C1_INTERNAL_RESCHEDULE_INJECTION|activation_id=${c1TimingSanitize(activationId)}|container_id=${c1TimingSanitize(
+                container.containerId.asString)}|reason=$c1InternalRescheduleInjectionReason|status=injected_once")(
               msg.transid)
             Future.failed(ContainerHealthError(msg.transid, c1InternalRescheduleInjectionReason))
           } else {
@@ -1381,20 +1471,19 @@ class FunctionPullingContainerProxy(
         // Sending the completion message to the controller after the active ack ensures proper ordering
         // (result is received before the completion message for blocking invokes).
         if (splitAckMessagesPendingLogCollection) {
-          sendResult.onComplete(
-            _ => {
-              if (!msg.blocking) {
-                emitC1TimingEvent("OW800", "openwhisk_result_notify_submit", msg)
-                emitC1TimingEvent("N800", "native_worker_result_notify_submit", msg)
-              }
-              sendActiveAck(
-                tid,
-                activation,
-                msg.blocking,
-                msg.rootControllerIndex,
-                msg.user.namespace.uuid,
-                CompletionMessage(tid, activation, instance))
-            })
+          sendResult.onComplete(_ => {
+            if (!msg.blocking) {
+              emitC1TimingEvent("OW800", "openwhisk_result_notify_submit", msg)
+              emitC1TimingEvent("N800", "native_worker_result_notify_submit", msg)
+            }
+            sendActiveAck(
+              tid,
+              activation,
+              msg.blocking,
+              msg.rootControllerIndex,
+              msg.user.namespace.uuid,
+              CompletionMessage(tid, activation, instance))
+          })
         }
 
         // Storing the record. Entirely asynchronous and not waited upon.
@@ -1492,10 +1581,10 @@ object FunctionPullingContainerProxy {
     "output_aes_gcm_duration_ns")
 
   private def c1EvidenceValue(value: JsValue): Option[String] = value match {
-    case JsString(content) => Some(content)
-    case JsNumber(content) => Some(content.toString)
+    case JsString(content)  => Some(content)
+    case JsNumber(content)  => Some(content.toString)
     case JsBoolean(content) => Some(content.toString)
-    case _ => None
+    case _                  => None
   }
 
   private def c1EvidenceField(fields: Map[String, JsValue], key: String): Option[String] =
@@ -1529,11 +1618,13 @@ object FunctionPullingContainerProxy {
           trace.toSeq.flatMap { traceFields =>
             traceFields.get("producer_timing_events") match {
               case Some(JsArray(events)) =>
-                val producerEvents = events.collect {
-                  case JsObject(fields)
-                      if c1EvidenceField(fields, "event_code").exists(c1AsynCSProducerEventCodes.contains) =>
-                    fields
-                }.take(c1AsynCSProducerEventCodes.size)
+                val producerEvents = events
+                  .collect {
+                    case JsObject(fields)
+                        if c1EvidenceField(fields, "event_code").exists(c1AsynCSProducerEventCodes.contains) =>
+                      fields
+                  }
+                  .take(c1AsynCSProducerEventCodes.size)
                 val firstEvent = producerEvents.headOption.getOrElse(Map.empty[String, JsValue])
                 val logicalRequestId = c1EvidenceField(firstEvent, "logical_request_id").getOrElse("")
                 val attemptId = c1EvidenceField(firstEvent, "attempt_id").getOrElse("")
@@ -1597,7 +1688,8 @@ object FunctionPullingContainerProxy {
                                  DocRevision,
                                  String,
                                  Int,
-                                 ContainerId) => ActorRef,
+                                 ContainerId,
+                                 Option[Long]) => ActorRef,
             ack: ActiveAck,
             store: (TransactionId, WhiskActivation, Boolean, UserContext) => Future[Any],
             collectLogs: LogsCollector,
@@ -1609,7 +1701,10 @@ object FunctionPullingContainerProxy {
             timeoutConfig: ContainerProxyTimeoutConfig,
             healthCheckConfig: ContainerProxyHealthCheckConfig =
               loadConfigOrThrow[ContainerProxyHealthCheckConfig](ConfigKeys.containerProxyHealth),
-            tcp: Option[ActorRef] = None)(implicit actorSystem: ActorSystem, logging: Logging) =
+            tcp: Option[ActorRef] = None,
+            targetBindingProvider: TargetBindingProvider = TargetBindingProvider.Disabled)(
+    implicit actorSystem: ActorSystem,
+    logging: Logging) =
     Props(
       new FunctionPullingContainerProxy(
         factory,
@@ -1628,7 +1723,8 @@ object FunctionPullingContainerProxy {
         poolConfig,
         timeoutConfig,
         healthCheckConfig,
-        tcp))
+        tcp,
+        targetBindingProvider))
 
   private val containerCount = new Counter
 
