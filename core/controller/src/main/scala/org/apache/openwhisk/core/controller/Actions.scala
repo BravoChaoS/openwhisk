@@ -1478,7 +1478,7 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                         case Success(_) =>
                           val preparedRequestResult =
                             if (
-                              request.profile == "asyncs" &&
+                              Set("asyncs", "reusable-concurrency").contains(request.profile) &&
                               request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow) {
                               C1BackendPressurePreparedRequests
                                 .load(
