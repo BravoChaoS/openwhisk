@@ -17,6 +17,7 @@
 
 package org.apache.openwhisk.core.scheduler.queue.test
 
+import common.StreamLogging
 import java.util.Base64
 
 import org.apache.pekko.util.ByteString
@@ -38,7 +39,7 @@ import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
 @RunWith(classOf[JUnitRunner])
-class TargetBoundActivationDispatcherTests extends AnyFlatSpec with Matchers {
+class TargetBoundActivationDispatcherTests extends AnyFlatSpec with Matchers with StreamLogging {
   private implicit val ec: ExecutionContext = ExecutionContext.global
 
   behavior of "GatewayTargetBoundActivationDispatcher"
@@ -66,6 +67,8 @@ class TargetBoundActivationDispatcherTests extends AnyFlatSpec with Matchers {
     parsed.sourceBindingId shouldBe 17
     parsed.warmed shouldBe false
     parsed.targetCode.map(_.kind) shouldBe Some(ProtectedObjectKind.Code)
+    logLines.exists(line => line.contains("event_code=RG270") && line.contains("operation=CODE_INPUT")) shouldBe true
+    logLines.exists(line => line.contains("event_code=RG280") && line.contains("status=success")) shouldBe true
   }
 
   it should "return only target INPUT for a warm pull without loading action code" in {
@@ -87,6 +90,7 @@ class TargetBoundActivationDispatcherTests extends AnyFlatSpec with Matchers {
     contract.fields should not contain TargetBoundActivationContent.TargetCodeField
     decodeTarget(contract, TargetBoundActivationContent.TargetInputField).direction shouldBe
       ProtectedEnvelopeDirection.GatewayToTarget
+    logLines.exists(line => line.contains("event_code=RG270") && line.contains("operation=INPUT")) shouldBe true
   }
 
   it should "leave existing non-target-bound profiles unchanged" in {

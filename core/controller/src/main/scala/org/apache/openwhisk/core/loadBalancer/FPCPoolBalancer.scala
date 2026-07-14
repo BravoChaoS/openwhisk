@@ -101,7 +101,7 @@ class FPCPoolBalancer(config: WhiskConfig,
         maxEnvelopeBytes = positiveInt("REUSABLE_GATEWAY_MAX_ENVELOPE_BYTES", 16777216))
       val gatewayExecutionContext = actorSystem.dispatchers.lookup("dispatchers.gateway-control-dispatcher")
       val gatewayClient = new P1GatewayControlClient(gatewayConfig)(gatewayExecutionContext)
-      new P1GatewayResultFinalizer(gatewayClient)(executionContext)
+      new P1GatewayResultFinalizer(gatewayClient)(executionContext, logging)
     }
   }
 

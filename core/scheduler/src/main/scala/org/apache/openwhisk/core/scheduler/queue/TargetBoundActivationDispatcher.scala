@@ -20,6 +20,7 @@ package org.apache.openwhisk.core.scheduler.queue
 import java.util.Base64
 
 import org.apache.openwhisk.core.connector.ActivationMessage
+import org.apache.openwhisk.common.Logging
 import org.apache.openwhisk.core.database.ArtifactStore
 import org.apache.openwhisk.core.entity._
 import org.apache.openwhisk.core.scheduler.grpc.GetActivation
@@ -120,9 +121,92 @@ final class WhiskActionExactRevisionProtectedCodeProvider(
   }
 }
 
-final class GatewayTargetBoundActivationDispatcher(codeProvider: ExactRevisionProtectedCodeProvider,
-                                                   gatewayClient: GatewayControlClient)(implicit ec: ExecutionContext)
+final class GatewayTargetBoundActivationDispatcher(
+  codeProvider: ExactRevisionProtectedCodeProvider,
+  gatewayClient: GatewayControlClient)(implicit ec: ExecutionContext, logging: Logging)
     extends TargetBoundActivationDispatcher {
+
+  private val timingNode = sys.env.get("C1_TIMING_NODE_ID").orElse(sys.env.get("HOSTNAME")).getOrElse("")
+  private val timingPid = java.lang.management.ManagementFactory.getRuntimeMXBean.getName.takeWhile(_ != '@')
+
+  private def timingValue(value: String): String =
+    Option(value).getOrElse("").replace('|', '_').replace('\n', ' ').replace('\r', ' ')
+
+  private def emitGatewayTiming(activation: ActivationMessage,
+                                eventCode: String,
+                                boundaryName: String,
+                                targetBindingId: Long,
+                                sourceInput: ProtectedEnvelopeV1,
+                                warmed: Boolean,
+                                status: String): Unit = {
+    val fields = Seq(
+      "event_code" -> eventCode,
+      "boundary_name" -> boundaryName,
+      "activation_id" -> activation.activationId.asString,
+      "transaction_id" -> activation.transid.id,
+      "operation" -> (if (warmed) "INPUT" else "CODE_INPUT"),
+      "source_binding_id" -> sourceInput.bindingId.toString,
+      "target_binding_id" -> targetBindingId.toString,
+      "request_id_hash" -> sourceInput.correlationHash.map(byte => f"${byte & 0xff}%02x").mkString,
+      "warmed" -> warmed.toString,
+      "status" -> status,
+      "node" -> timingNode,
+      "process" -> "openwhisk_scheduler",
+      "pid" -> timingPid,
+      "tid" -> activation.transid.id,
+      "unix_ns" -> (System.currentTimeMillis() * 1000000L).toString,
+      "mono_ns" -> System.nanoTime().toString,
+      "clock_domain" -> "openwhisk_scheduler_jvm_mono")
+    logging.info(
+      this,
+      s"C1TIMING_EVENT|${fields.map { case (key, value) => s"$key=${timingValue(value)}" }.mkString("|")}")(
+      activation.transid)
+  }
+
+  private def timedTargetReencryption(
+    activation: ActivationMessage,
+    targetBindingId: Long,
+    sourceInput: ProtectedEnvelopeV1,
+    warmed: Boolean)(operation: => Future[Either[TargetReencryptionError, ActivationMessage]])
+    : Future[Either[TargetReencryptionError, ActivationMessage]] = {
+    emitGatewayTiming(
+      activation,
+      "RG270",
+      "reusable_gateway_target_reencrypt_enter",
+      targetBindingId,
+      sourceInput,
+      warmed,
+      "started")
+    operation.andThen {
+      case scala.util.Success(Right(_)) =>
+        emitGatewayTiming(
+          activation,
+          "RG280",
+          "reusable_gateway_target_reencrypt_exit",
+          targetBindingId,
+          sourceInput,
+          warmed,
+          "success")
+      case scala.util.Success(Left(_)) =>
+        emitGatewayTiming(
+          activation,
+          "RG280",
+          "reusable_gateway_target_reencrypt_exit",
+          targetBindingId,
+          sourceInput,
+          warmed,
+          "failure")
+      case scala.util.Failure(_) =>
+        emitGatewayTiming(
+          activation,
+          "RG280",
+          "reusable_gateway_target_reencrypt_exit",
+          targetBindingId,
+          sourceInput,
+          warmed,
+          "exception")
+    }
+  }
 
   override def prepare(request: GetActivation,
                        activation: ActivationMessage): Future[Either[TargetReencryptionError, ActivationMessage]] =
@@ -142,35 +226,39 @@ final class GatewayTargetBoundActivationDispatcher(codeProvider: ExactRevisionPr
       TargetBoundActivationContent.sourceInput(activation.content) match {
         case Left(error) => Future.successful(Left(error))
         case Right(sourceInput) if request.warmed =>
-          reencrypt(targetBindingId, sourceInput).map(
-            _.map(
-              targetInput =>
-                withTargetDispatch(
-                  activation,
-                  targetBindingId,
-                  sourceInput.bindingId,
-                  activation.revision,
-                  warmed = true,
-                  targetInput,
-                  None)))
+          timedTargetReencryption(activation, targetBindingId, sourceInput, warmed = true) {
+            reencrypt(targetBindingId, sourceInput).map(
+              _.map(
+                targetInput =>
+                  withTargetDispatch(
+                    activation,
+                    targetBindingId,
+                    sourceInput.bindingId,
+                    activation.revision,
+                    warmed = true,
+                    targetInput,
+                    None)))
+          }
         case Right(sourceInput) =>
           codeProvider.load(activation).flatMap {
             case Left(error) => Future.successful(Left(error))
             case Right(sourceCode) =>
-              reencrypt(targetBindingId, sourceCode.envelope).flatMap {
-                case Left(error) => Future.successful(Left(error))
-                case Right(targetCode) =>
-                  reencrypt(targetBindingId, sourceInput).map(
-                    _.map(
-                      targetInput =>
-                        withTargetDispatch(
-                          activation,
-                          targetBindingId,
-                          sourceInput.bindingId,
-                          sourceCode.exactRevision,
-                          warmed = false,
-                          targetInput,
-                          Some(targetCode))))
+              timedTargetReencryption(activation, targetBindingId, sourceInput, warmed = false) {
+                reencrypt(targetBindingId, sourceCode.envelope).flatMap {
+                  case Left(error) => Future.successful(Left(error))
+                  case Right(targetCode) =>
+                    reencrypt(targetBindingId, sourceInput).map(
+                      _.map(
+                        targetInput =>
+                          withTargetDispatch(
+                            activation,
+                            targetBindingId,
+                            sourceInput.bindingId,
+                            sourceCode.exactRevision,
+                            warmed = false,
+                            targetInput,
+                            Some(targetCode))))
+                }
               }
           }
       }

@@ -20,6 +20,7 @@ package org.apache.openwhisk.core.loadBalancer
 import java.util.Base64
 
 import org.apache.openwhisk.core.entity.{ActivationResponse, WhiskActivation}
+import org.apache.openwhisk.common.Logging
 import org.apache.openwhisk.core.scheduler.queue.{GatewayControlClient, TargetBoundActivationContent}
 import spray.json._
 
@@ -53,8 +54,43 @@ object GatewayResultFinalizer {
     activation.copy(response = ActivationResponse.whiskError(s"target result finalization failed: $reason"))
 }
 
-final class P1GatewayResultFinalizer(gatewayClient: GatewayControlClient)(implicit ec: ExecutionContext)
+final class P1GatewayResultFinalizer(gatewayClient: GatewayControlClient)(implicit ec: ExecutionContext,
+                                                                          logging: Logging)
     extends GatewayResultFinalizer {
+
+  private val timingNode = sys.env.get("C1_TIMING_NODE_ID").orElse(sys.env.get("HOSTNAME")).getOrElse("")
+  private val timingPid = java.lang.management.ManagementFactory.getRuntimeMXBean.getName.takeWhile(_ != '@')
+
+  private def timingValue(value: String): String =
+    Option(value).getOrElse("").replace('|', '_').replace('\n', ' ').replace('\r', ' ')
+
+  private def emitGatewayTiming(activation: WhiskActivation,
+                                eventCode: String,
+                                boundaryName: String,
+                                sourceBindingId: Long,
+                                targetBindingId: Long,
+                                requestIdHash: String,
+                                status: String): Unit = {
+    val fields = Seq(
+      "event_code" -> eventCode,
+      "boundary_name" -> boundaryName,
+      "activation_id" -> activation.activationId.asString,
+      "operation" -> "RESULT",
+      "source_binding_id" -> sourceBindingId.toString,
+      "target_binding_id" -> targetBindingId.toString,
+      "request_id_hash" -> requestIdHash,
+      "status" -> status,
+      "node" -> timingNode,
+      "process" -> "openwhisk_controller",
+      "pid" -> timingPid,
+      "tid" -> "gateway-result-finalizer",
+      "unix_ns" -> (System.currentTimeMillis() * 1000000L).toString,
+      "mono_ns" -> System.nanoTime().toString,
+      "clock_domain" -> "openwhisk_controller_jvm_mono")
+    logging.info(
+      this,
+      s"C1TIMING_EVENT|${fields.map { case (key, value) => s"$key=${timingValue(value)}" }.mkString("|")}")
+  }
 
   override def finalizeResult(activation: WhiskActivation): Future[Either[String, WhiskActivation]] = {
     if (!GatewayResultFinalizer.containsTargetResult(activation.response.result)) {
@@ -63,14 +99,39 @@ final class P1GatewayResultFinalizer(gatewayClient: GatewayControlClient)(implic
       TargetBoundActivationContent.parseTargetResult(activation.response.result) match {
         case Left(error) => Future.successful(Left(error.targetReencryptionError))
         case Right(targetResult) =>
+          emitGatewayTiming(
+            activation,
+            "RG810",
+            "reusable_gateway_result_reencrypt_enter",
+            targetResult.sourceBindingId,
+            targetResult.targetBindingId,
+            targetResult.requestIdHash,
+            "started")
           gatewayClient
             .reencryptResultToSource(
               targetResult.sourceBindingId,
               targetResult.targetBindingId,
               targetResult.targetEnvelope)
             .map {
-              case Left(error) => Left(error.message)
+              case Left(error) =>
+                emitGatewayTiming(
+                  activation,
+                  "RG820",
+                  "reusable_gateway_result_reencrypt_exit",
+                  targetResult.sourceBindingId,
+                  targetResult.targetBindingId,
+                  targetResult.requestIdHash,
+                  "failure")
+                Left(error.message)
               case Right(sourceEnvelope) =>
+                emitGatewayTiming(
+                  activation,
+                  "RG820",
+                  "reusable_gateway_result_reencrypt_exit",
+                  targetResult.sourceBindingId,
+                  targetResult.targetBindingId,
+                  targetResult.requestIdHash,
+                  "success")
                 val result = JsObject(
                   GatewayResultFinalizer.ClientEnvelopeField -> JsString(
                     Base64.getEncoder.encodeToString(sourceEnvelope.bytes.toArray)),
@@ -79,7 +140,16 @@ final class P1GatewayResultFinalizer(gatewayClient: GatewayControlClient)(implic
                 Right(activation.copy(response = ActivationResponse.success(Some(result))))
             }
             .recover {
-              case NonFatal(t) => Left(s"Gateway result exchange failed: ${t.getClass.getSimpleName}")
+              case NonFatal(t) =>
+                emitGatewayTiming(
+                  activation,
+                  "RG820",
+                  "reusable_gateway_result_reencrypt_exit",
+                  targetResult.sourceBindingId,
+                  targetResult.targetBindingId,
+                  targetResult.requestIdHash,
+                  "exception")
+                Left(s"Gateway result exchange failed: ${t.getClass.getSimpleName}")
             }
       }
     }

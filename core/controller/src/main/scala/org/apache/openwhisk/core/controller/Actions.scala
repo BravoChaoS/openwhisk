@@ -18,6 +18,7 @@
 package org.apache.openwhisk.core.controller
 
 import java.lang.management.ManagementFactory
+import java.util.Base64
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
 import java.security.MessageDigest
@@ -52,6 +53,7 @@ import org.apache.openwhisk.http.Messages._
 import org.apache.openwhisk.core.entitlement.Resource
 import org.apache.openwhisk.core.entitlement.Collection
 import org.apache.openwhisk.core.loadBalancer.LoadBalancerException
+import org.apache.openwhisk.core.scheduler.queue.{ProtectedCorrelationKind, ProtectedEnvelopeDirection, ProtectedEnvelopeV1, ProtectedObjectKind, TargetBoundActivationContent}
 import pureconfig._
 import org.apache.openwhisk.core.ConfigKeys
 
@@ -103,7 +105,11 @@ private[controller] final case class C1BackendPressurePreparedRequest(ordinal: I
 private[controller] final case class C1BackendPressureActionIdentity(canonicalFqen: JsObject, revision: String)
 
 private[controller] object C1BackendPressurePreparedRequests {
-  private val schemaVersion = "c1-asyncs-premeasurement-requests-v1"
+  private val asyncsProfile = "asyncs"
+  private val reusableConcurrencyProfile = "reusable-concurrency"
+  private val schemaVersions = Map(
+    asyncsProfile -> "c1-asyncs-premeasurement-requests-v1",
+    reusableConcurrencyProfile -> "c1-reusable-concurrency-premeasurement-requests-v1")
 
   def actionIdentity(action: WhiskActionMetaData): C1BackendPressureActionIdentity =
     C1BackendPressureActionIdentity(
@@ -164,15 +170,59 @@ private[controller] object C1BackendPressurePreparedRequests {
     digest.digest().map(byte => f"${byte & 0xff}%02x").mkString
   }
 
+  private def validateActionParams(profile: String,
+                                   ordinal: Int,
+                                   logicalRequestId: String,
+                                   expectedRid: String,
+                                   actionParams: JsObject): Unit = {
+    if (profile == asyncsProfile) {
+      val actionFields = actionParams.fields
+      if (requiredString(actionFields, "logical_request_id") != logicalRequestId) {
+        deserializationError(s"prepared request row $ordinal action logical_request_id does not match")
+      }
+      if (requiredString(actionFields, "attempt_id") != "1") {
+        deserializationError(s"prepared request row $ordinal attempt_id must be 1")
+      }
+    } else if (profile == reusableConcurrencyProfile) {
+      val outer = actionParams.fields
+      if (outer.keySet != Set(TargetBoundActivationContent.RootField)) {
+        deserializationError(s"prepared request row $ordinal must contain only the reusable protected-input root")
+      }
+      val root = outer(TargetBoundActivationContent.RootField).asJsObject.fields
+      if (root.keySet != Set(TargetBoundActivationContent.SourceInputField)) {
+        deserializationError(s"prepared request row $ordinal must contain only sourceProtectedInputEnvelope")
+      }
+      val encoded = requiredString(root, TargetBoundActivationContent.SourceInputField)
+      val envelope = try {
+        ProtectedEnvelopeV1
+          .decode(org.apache.pekko.util.ByteString.fromArray(Base64.getDecoder.decode(encoded)))
+          .fold(message => deserializationError(s"prepared request row $ordinal has an invalid INPUT envelope: $message"), identity)
+      } catch {
+        case NonFatal(_) => deserializationError(s"prepared request row $ordinal has invalid base64 INPUT")
+      }
+      val correlationHash = envelope.correlationHash.map(byte => f"${byte & 0xff}%02x").mkString
+      if (envelope.kind != ProtectedObjectKind.Input ||
+          envelope.direction != ProtectedEnvelopeDirection.SourceToGateway ||
+          envelope.correlationKind != ProtectedCorrelationKind.RequestId ||
+          correlationHash != expectedRid) {
+        deserializationError(s"prepared request row $ordinal does not match the reusable INPUT/RID contract")
+      }
+    } else {
+      deserializationError(s"prepared request profile is unsupported: $profile")
+    }
+  }
+
   private def loadUnsafe(sourceDirectory: String,
                          expectedCount: Int,
-                         expectedWorkloadId: String): Vector[C1BackendPressurePreparedRequest] = {
+                         expectedWorkloadId: String,
+                         profile: String): Vector[C1BackendPressurePreparedRequest] = {
     val source = Paths.get(sourceDirectory)
     val manifestPath = source.resolve("manifest.json")
     if (!Files.isRegularFile(manifestPath)) {
       deserializationError(s"prepared request manifest is not ready: $manifestPath")
     }
     val manifest = new String(Files.readAllBytes(manifestPath), StandardCharsets.UTF_8).parseJson.asJsObject.fields
+    val schemaVersion = schemaVersions.getOrElse(profile, deserializationError(s"prepared request profile is unsupported: $profile"))
     if (requiredString(manifest, "schema_version") != schemaVersion) {
       deserializationError(s"prepared request schema_version must be $schemaVersion")
     }
@@ -210,17 +260,12 @@ private[controller] object C1BackendPressurePreparedRequests {
           deserializationError(s"prepared request row $ordinal is out of order")
         }
         val actionParams = requiredObject(fields, "action_params")
-        val actionFields = actionParams.fields
-        if (requiredString(actionFields, "logical_request_id") != logicalRequestId) {
-          deserializationError(s"prepared request row $ordinal action logical_request_id does not match")
-        }
-        if (requiredString(actionFields, "attempt_id") != "1") {
-          deserializationError(s"prepared request row $ordinal attempt_id must be 1")
-        }
+        val expectedRid = requiredString(fields, "expected_rid")
+        validateActionParams(profile, ordinal, logicalRequestId, expectedRid, actionParams)
         rows += C1BackendPressurePreparedRequest(
           ordinal,
           logicalRequestId,
-          requiredString(fields, "expected_rid"),
+          expectedRid,
           actionParams)
         ordinal += 1
         line = reader.readLine()
@@ -237,9 +282,10 @@ private[controller] object C1BackendPressurePreparedRequests {
 
   def load(sourceDirectory: String,
            expectedCount: Int,
-           expectedWorkloadId: String): Either[String, Vector[C1BackendPressurePreparedRequest]] =
+           expectedWorkloadId: String,
+           profile: String = asyncsProfile): Either[String, Vector[C1BackendPressurePreparedRequest]] =
     try {
-      Right(loadUnsafe(sourceDirectory, expectedCount, expectedWorkloadId))
+      Right(loadUnsafe(sourceDirectory, expectedCount, expectedWorkloadId, profile))
     } catch {
       case NonFatal(error) => Left(Option(error.getMessage).getOrElse(error.getClass.getSimpleName))
     }
@@ -575,18 +621,19 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
       errorIf(request.workload_id.trim.isEmpty, "workload_id is required"),
       errorIf(
         request.prepared_request_source.nonEmpty &&
-          !(request.profile == "asyncs" && request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow),
-        "prepared_request_source is only valid for asyncs completion_window"),
+          !(Set("asyncs", "reusable-concurrency").contains(request.profile) &&
+            request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow),
+        "prepared_request_source is only valid for asyncs or reusable-concurrency completion_window"),
       errorIf(
-        request.profile == "asyncs" &&
+          Set("asyncs", "reusable-concurrency").contains(request.profile) &&
           request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow &&
           request.prepared_request_source.forall(_.trim.isEmpty),
-        "prepared_request_source is required for asyncs completion_window"),
+        "prepared_request_source is required for asyncs or reusable-concurrency completion_window"),
       errorIf(
-        request.profile == "asyncs" &&
+          Set("asyncs", "reusable-concurrency").contains(request.profile) &&
           request.request_generation_mode == c1BackendPressureRequestModeCompletionWindow &&
           request.failure_probability != 0.0,
-        "asyncs completion_window currently requires failure_probability=0")).flatten ++ modeErrors.flatten
+        "asyncs and reusable-concurrency completion_window currently require failure_probability=0")).flatten ++ modeErrors.flatten
 
     if (errors.isEmpty) None else Some(errors.mkString("; "))
   }
@@ -1437,7 +1484,8 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
                                 .load(
                                   request.prepared_request_source.get,
                                   request.planned_logical_requests,
-                                  request.workload_id)
+                                  request.workload_id,
+                                  request.profile)
                                 .map(requests => Some(requests))
                             } else {
                               Right(None)

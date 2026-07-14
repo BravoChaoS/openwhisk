@@ -20,7 +20,9 @@ package org.apache.openwhisk.core.controller.test
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
 import java.security.MessageDigest
+import java.util.Base64
 import scala.collection.JavaConverters._
+import org.apache.pekko.util.ByteString
 import org.junit.runner.RunWith
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.flatspec.AnyFlatSpec
@@ -30,6 +32,7 @@ import spray.json._
 import org.apache.openwhisk.core.controller.{C1BackendPressurePreparedRequest, C1BackendPressurePreparedRequests}
 import org.apache.openwhisk.core.entity.ExecManifest.ImageName
 import org.apache.openwhisk.core.entity._
+import org.apache.openwhisk.core.scheduler.queue.{ProtectedCorrelationKind, ProtectedEnvelopeDirection, ProtectedEnvelopeV1, ProtectedObjectKind, TargetBoundActivationContent}
 
 @RunWith(classOf[JUnitRunner])
 class C1BackendPressurePreparedRequestsTests extends AnyFlatSpec with Matchers with BeforeAndAfterEach {
@@ -82,6 +85,39 @@ class C1BackendPressurePreparedRequestsTests extends AnyFlatSpec with Matchers w
     Files.write(root.resolve("manifest.json"), (manifest.prettyPrint + "\n").getBytes(StandardCharsets.UTF_8))
   }
 
+  private def writeReusableSource(): String = {
+    val correlation = ByteString.fromArray((0 until 32).map(_.toByte).toArray)
+    val expectedRid = correlation.map(byte => f"${byte & 0xff}%02x").mkString
+    val envelope = ProtectedEnvelopeV1(
+      ProtectedObjectKind.Input,
+      ProtectedEnvelopeDirection.SourceToGateway,
+      bindingId = 17,
+      ProtectedCorrelationKind.RequestId,
+      correlation,
+      ByteString.fromArray((32 until 44).map(_.toByte).toArray),
+      ByteString("protected-input"),
+      ByteString.fromArray(Array.fill(16)(1.toByte)))
+    val actionParams = JsObject(
+      TargetBoundActivationContent.RootField -> JsObject(
+        TargetBoundActivationContent.SourceInputField -> JsString(Base64.getEncoder.encodeToString(envelope.bytes.toArray))))
+    val row = JsObject(
+      "action_params" -> actionParams,
+      "expected_rid" -> JsString(expectedRid),
+      "logical_request_id" -> JsString("1"),
+      "ordinal" -> JsNumber(1)).compactPrint
+    val requestBytes = (row + "\n").getBytes(StandardCharsets.UTF_8)
+    Files.write(root.resolve("requests.jsonl"), requestBytes)
+    val manifest = JsObject(
+      "configured_request_count" -> JsNumber(1),
+      "failure_probability" -> JsNumber(0),
+      "requests_file" -> JsString("requests.jsonl"),
+      "requests_sha256" -> JsString(sha256(requestBytes)),
+      "schema_version" -> JsString("c1-reusable-concurrency-premeasurement-requests-v1"),
+      "workload" -> JsObject("workload_id" -> JsString("reusable-concurrency-sleep77")))
+    Files.write(root.resolve("manifest.json"), (manifest.prettyPrint + "\n").getBytes(StandardCharsets.UTF_8))
+    expectedRid
+  }
+
   behavior of "C1 backend-pressure prepared request source"
 
   it should "load sequential action parameters without provider-owned resolved identity" in {
@@ -110,6 +146,20 @@ class C1BackendPressurePreparedRequestsTests extends AnyFlatSpec with Matchers w
       "version" -> JsString("1.2.3"),
       "binding" -> JsString("fixture-namespace/source-package"))
     identity.revision shouldBe "7-fixture-revision"
+  }
+
+  it should "load only a target-independent reusable INPUT envelope with matching RID" in {
+    val expectedRid = writeReusableSource()
+
+    val result = C1BackendPressurePreparedRequests.load(
+      root.toString,
+      expectedCount = 1,
+      expectedWorkloadId = "reusable-concurrency-sleep77",
+      profile = "reusable-concurrency")
+
+    result.isRight shouldBe true
+    result.right.get.head.expectedRid shouldBe expectedRid
+    result.right.get.head.actionParams.fields.keySet shouldBe Set(TargetBoundActivationContent.RootField)
   }
 
   it should "describe the real prepared request submit boundary without exposing request payloads" in {

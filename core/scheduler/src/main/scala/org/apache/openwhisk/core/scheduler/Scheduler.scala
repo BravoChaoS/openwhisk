@@ -87,7 +87,7 @@ class Scheduler(schedulerId: SchedulerInstanceId, schedulerEndpoints: SchedulerE
       val gatewayExecutionContext = actorSystem.dispatchers.lookup("dispatchers.gateway-control-dispatcher")
       val gatewayClient = new P1GatewayControlClient(targetBoundDispatchConfig)(gatewayExecutionContext)
       val codeProvider = WhiskActionExactRevisionProtectedCodeProvider(entityStore)(ec)
-      new GatewayTargetBoundActivationDispatcher(codeProvider, gatewayClient)(ec)
+      new GatewayTargetBoundActivationDispatcher(codeProvider, gatewayClient)(ec, logging)
     } else {
       TargetBoundActivationDispatcher.Unconfigured
     }

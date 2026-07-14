@@ -17,6 +17,7 @@
 
 package org.apache.openwhisk.core.loadBalancer.test
 
+import common.StreamLogging
 import java.time.Instant
 import java.util.Base64
 
@@ -34,7 +35,7 @@ import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
 @RunWith(classOf[JUnitRunner])
-class GatewayResultFinalizerTests extends AnyFlatSpec with Matchers {
+class GatewayResultFinalizerTests extends AnyFlatSpec with Matchers with StreamLogging {
   private implicit val ec: ExecutionContext = ExecutionContext.global
 
   behavior of "P1GatewayResultFinalizer"
@@ -63,6 +64,8 @@ class GatewayResultFinalizerTests extends AnyFlatSpec with Matchers {
     fields(GatewayResultFinalizer.ClientEnvelopeField) shouldBe
       JsString(Base64.getEncoder.encodeToString(g2s.bytes.toArray))
     fields should not contain TargetBoundActivationContent.ResultRootField
+    logLines.exists(line => line.contains("event_code=RG810") && line.contains("operation=RESULT")) shouldBe true
+    logLines.exists(line => line.contains("event_code=RG820") && line.contains("status=success")) shouldBe true
   }
 
   it should "return an explicit failure without exposing the target envelope" in {
