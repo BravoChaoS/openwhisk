@@ -30,7 +30,9 @@ import scala.concurrent.blocking
 import scala.concurrent.duration.FiniteDuration
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
-import scala.util.{Failure, Success}
+import scala.io.Source
+import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 
 /** Opaque control-side handle for one ACTIVE container target. */
 final case class TargetBinding(id: Long) {
@@ -71,10 +73,45 @@ object TargetBindingProvider {
   }
 }
 
-/** Worker-local S1 bridge that maps one public DH endpoint to one concrete container endpoint. */
+/** Worker-routable DH endpoint allocated by the bridge for one concrete container. */
+final case class TargetEndpointBinding(containerIdentity: String, endpointHost: String, endpointPort: Int) {
+  require(containerIdentity.nonEmpty, "target endpoint container identity must not be empty")
+  require(endpointHost.nonEmpty, "target endpoint host must not be empty")
+  require(endpointPort > 0 && endpointPort <= 65535, "target endpoint port is invalid")
+}
+
+/** Worker-local bridge that maps one allocated DH endpoint to one concrete container endpoint. */
 trait TargetEndpointBridgeClient {
-  def bind(containerIdentity: String, targetHost: String, targetPort: Int): Future[Unit]
+  def bind(containerIdentity: String, targetHost: String, targetPort: Int): Future[TargetEndpointBinding]
   def unbind(containerIdentity: String): Future[Unit]
+}
+
+object HttpTargetEndpointBridgeClient {
+  private[v2] def parseBindingResponse(expectedContainerIdentity: String,
+                                       responseBody: String): TargetEndpointBinding = {
+    val response = responseBody.parseJson.asJsObject
+    val binding = response.fields.get("binding") match {
+      case Some(value: JsObject) => value
+      case _                     => throw new IllegalArgumentException("target endpoint bridge response is missing binding")
+    }
+
+    def requiredString(field: String): String =
+      binding.fields.get(field) match {
+        case Some(JsString(value)) if value.trim.nonEmpty => value.trim
+        case _                                            => throw new IllegalArgumentException(s"target endpoint bridge response has invalid $field")
+      }
+
+    val containerIdentity = requiredString("containerIdentity")
+    if (containerIdentity != expectedContainerIdentity) {
+      throw new IllegalArgumentException("target endpoint bridge response has the wrong container identity")
+    }
+    val endpointHost = requiredString("endpointHost")
+    val endpointPort = binding.fields.get("endpointPort") match {
+      case Some(JsNumber(value)) if value.isWhole && value >= 1 && value <= 65535 => value.toInt
+      case _                                                                      => throw new IllegalArgumentException("target endpoint bridge response has invalid endpointPort")
+    }
+    TargetEndpointBinding(containerIdentity, endpointHost, endpointPort)
+  }
 }
 
 final class HttpTargetEndpointBridgeClient(controlHost: String,
@@ -86,18 +123,27 @@ final class HttpTargetEndpointBridgeClient(controlHost: String,
   require(controlHost.nonEmpty, "target bridge control host must not be empty")
   require(controlPort > 0 && controlPort <= 65535, "target bridge control port is invalid")
 
-  override def bind(containerIdentity: String, targetHost: String, targetPort: Int): Future[Unit] = {
+  override def bind(containerIdentity: String, targetHost: String, targetPort: Int): Future[TargetEndpointBinding] = {
     val body = JsObject(
       "containerIdentity" -> JsString(containerIdentity),
       "targetHost" -> JsString(targetHost),
       "targetPort" -> JsNumber(targetPort)).compactPrint
     request("PUT", "/binding", Some(body))
+      .flatMap { responseBody =>
+        Future
+          .fromTry(Try(HttpTargetEndpointBridgeClient.parseBindingResponse(containerIdentity, responseBody)))
+          .recoverWith {
+            case NonFatal(parseFailure) =>
+              unbind(containerIdentity).transformWith(_ => Future.failed(parseFailure))
+          }
+      }
   }
 
   override def unbind(containerIdentity: String): Future[Unit] =
-    request("DELETE", s"/binding/${URLEncoder.encode(containerIdentity, StandardCharsets.UTF_8.name())}", None)
+    request("DELETE", s"/binding/${URLEncoder.encode(containerIdentity, StandardCharsets.UTF_8.name())}", None).map(_ =>
+      ())
 
-  private def request(method: String, path: String, body: Option[String]): Future[Unit] = Future {
+  private def request(method: String, path: String, body: Option[String]): Future[String] = Future {
     blocking {
       val connection =
         new URL(s"http://$controlHost:$controlPort$path").openConnection().asInstanceOf[HttpURLConnection]
@@ -115,10 +161,18 @@ final class HttpTargetEndpointBridgeClient(controlHost: String,
           finally output.close()
         }
         val status = connection.getResponseCode
-        Option(if (status / 100 == 2) connection.getInputStream else connection.getErrorStream).foreach(_.close())
+        val stream = Option(if (status / 100 == 2) connection.getInputStream else connection.getErrorStream)
+        val responseBody = stream
+          .map { input =>
+            val source = Source.fromInputStream(input, StandardCharsets.UTF_8.name())
+            try source.mkString
+            finally source.close()
+          }
+          .getOrElse("")
         if (status / 100 != 2) {
           throw new IllegalStateException(s"target endpoint bridge $method failed: status=$status")
         }
+        responseBody
       } finally connection.disconnect()
     }
   }
@@ -135,15 +189,11 @@ final class HttpTargetEndpointBridgeClient(controlHost: String,
 final class GatewayTargetBindingProvider(
   gatewayClient: GatewayControlClient,
   bridgeClient: TargetEndpointBridgeClient,
-  endpointHost: String,
-  endpointPort: Int,
   containerEndpointPort: Int,
   readyTimeout: FiniteDuration,
   retryInterval: FiniteDuration)(implicit actorSystem: ActorSystem, ec: ExecutionContext)
     extends TargetBindingProvider {
 
-  require(endpointHost.nonEmpty, "target endpoint host must not be empty")
-  require(endpointPort > 0 && endpointPort <= 65535, "target endpoint port is invalid")
   require(containerEndpointPort > 0 && containerEndpointPort <= 65535, "container target endpoint port is invalid")
   require(readyTimeout.toMillis > 0, "target readiness timeout must be positive")
   require(retryInterval.toMillis > 0, "target readiness retry interval must be positive")
@@ -155,9 +205,9 @@ final class GatewayTargetBindingProvider(
     val deadline = readyTimeout.fromNow
     val containerIdentity = target.containerId.asString
 
-    def register(): Future[TargetBinding] =
+    def register(endpoint: TargetEndpointBinding): Future[TargetBinding] =
       gatewayClient
-        .registerTarget(containerIdentity, endpointHost, endpointPort)
+        .registerTarget(containerIdentity, endpoint.endpointHost, endpoint.endpointPort)
         .flatMap {
           case Right(registered) =>
             target
@@ -168,15 +218,15 @@ final class GatewayTargetBindingProvider(
                   closeGateway(registered.targetBindingId).transformWith(_ => Future.failed(activationFailure))
               }
           case Left(error) if deadline.hasTimeLeft() =>
-            after(retryInterval, actorSystem.scheduler)(register())
+            after(retryInterval, actorSystem.scheduler)(register(endpoint))
           case Left(error) =>
             Future.failed(new IllegalStateException(s"Gateway target registration failed: ${error.message}"))
         }
 
     bridgeClient
       .bind(containerIdentity, target.address.host, containerEndpointPort)
-      .flatMap { _ =>
-        register().recoverWith {
+      .flatMap { endpoint =>
+        register(endpoint).recoverWith {
           case failure =>
             bridgeClient.unbind(containerIdentity).transformWith(_ => Future.failed(failure))
         }

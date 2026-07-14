@@ -55,6 +55,34 @@ class TargetBoundRuntimeContractTests
     super.afterAll()
   }
 
+  behavior of "HttpTargetEndpointBridgeClient"
+
+  it should "parse a matching container-specific endpoint" in {
+    val binding = HttpTargetEndpointBridgeClient.parseBindingResponse(
+      "container-1",
+      """{"status":"ready","binding":{"containerIdentity":"container-1","endpointHost":"172.18.89.215","endpointPort":9201,"targetHost":"10.0.0.2","targetPort":9200}}""")
+
+    binding shouldBe TargetEndpointBinding("container-1", "172.18.89.215", 9201)
+  }
+
+  it should "reject a mismatched container identity or invalid endpoint" in {
+    intercept[IllegalArgumentException] {
+      HttpTargetEndpointBridgeClient.parseBindingResponse(
+        "container-1",
+        """{"status":"ready","binding":{"containerIdentity":"container-2","endpointHost":"172.18.89.215","endpointPort":9201}}""")
+    }
+    intercept[IllegalArgumentException] {
+      HttpTargetEndpointBridgeClient.parseBindingResponse(
+        "container-1",
+        """{"status":"ready","binding":{"containerIdentity":"container-1","endpointHost":"","endpointPort":9201}}""")
+    }
+    intercept[IllegalArgumentException] {
+      HttpTargetEndpointBridgeClient.parseBindingResponse(
+        "container-1",
+        """{"status":"ready","binding":{"containerIdentity":"container-1","endpointHost":"172.18.89.215","endpointPort":0}}""")
+    }
+  }
+
   behavior of "GatewayTargetBindingProvider"
 
   it should "register ACTIVE, write the binding into the same executor, and close it" in {
@@ -66,7 +94,7 @@ class TargetBoundRuntimeContractTests
         targetHost shouldBe "10.0.0.2"
         targetPort shouldBe 9200
         lifecycle += "bridge-put"
-        Future.successful(())
+        Future.successful(TargetEndpointBinding(containerIdentity, "172.18.89.215", 9201))
       }
       override def unbind(containerIdentity: String) = {
         containerIdentity shouldBe "container-1"
@@ -79,7 +107,7 @@ class TargetBoundRuntimeContractTests
         lifecycle += "gateway-register"
         containerIdentity shouldBe "container-1"
         endpointHost shouldBe "172.18.89.215"
-        endpointPort shouldBe 9200
+        endpointPort shouldBe 9201
         Future.successful(Right(GatewayRegisteredTarget(41, 7)))
       }
       override def closeTarget(targetBindingId: Long) = {
@@ -91,7 +119,7 @@ class TargetBoundRuntimeContractTests
         Future.successful(Left(GatewayControlProtocolError("unused")))
     }
     val provider =
-      new GatewayTargetBindingProvider(gateway, bridge, "172.18.89.215", 9200, 9200, 2.seconds, 10.millis)
+      new GatewayTargetBindingProvider(gateway, bridge, 9200, 2.seconds, 10.millis)
     val target = TargetContainer(
       ContainerId("container-1"),
       ContainerAddress("10.0.0.2"),
@@ -114,7 +142,7 @@ class TargetBoundRuntimeContractTests
     val bridge = new TargetEndpointBridgeClient {
       override def bind(containerIdentity: String, targetHost: String, targetPort: Int) = {
         lifecycle += "bridge-put"
-        Future.successful(())
+        Future.successful(TargetEndpointBinding(containerIdentity, "172.18.89.215", 9202))
       }
       override def unbind(containerIdentity: String) = {
         lifecycle += "bridge-delete"
@@ -124,6 +152,8 @@ class TargetBoundRuntimeContractTests
     val gateway = new GatewayControlClient {
       override def registerTarget(containerIdentity: String, endpointHost: String, endpointPort: Int) = {
         lifecycle += "gateway-register"
+        endpointHost shouldBe "172.18.89.215"
+        endpointPort shouldBe 9202
         Future.successful(Right(GatewayRegisteredTarget(42, 8)))
       }
       override def closeTarget(targetBindingId: Long) = {
@@ -134,7 +164,7 @@ class TargetBoundRuntimeContractTests
         Future.successful(Left(GatewayControlProtocolError("unused")))
     }
     val provider =
-      new GatewayTargetBindingProvider(gateway, bridge, "172.18.89.215", 9200, 9200, 2.seconds, 10.millis)
+      new GatewayTargetBindingProvider(gateway, bridge, 9200, 2.seconds, 10.millis)
     val target = TargetContainer(
       ContainerId("container-2"),
       ContainerAddress("10.0.0.3"),
