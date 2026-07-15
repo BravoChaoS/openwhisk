@@ -83,6 +83,20 @@ class TargetBoundRuntimeContractTests
     }
   }
 
+  it should "retain only stable bridge failure codes" in {
+    HttpTargetEndpointBridgeClient.parseErrorCode(
+      """{"error":"container runtime is not ready","code":"target_runtime_not_ready"}""") shouldBe
+      HttpTargetEndpointBridgeClient.TargetRuntimeNotReadyCode
+    HttpTargetEndpointBridgeClient.parseErrorCode(
+      """{"error":"listener failed","code":"relay_listener_unavailable"}""") shouldBe
+      HttpTargetEndpointBridgeClient.RelayListenerUnavailableCode
+    HttpTargetEndpointBridgeClient.parseErrorCode(
+      """{"error":"private implementation detail","code":"not-allowlisted"}""") shouldBe
+      HttpTargetEndpointBridgeClient.UnknownErrorCode
+    HttpTargetEndpointBridgeClient.parseErrorCode("not-json") shouldBe
+      HttpTargetEndpointBridgeClient.UnknownErrorCode
+  }
+
   behavior of "GatewayTargetBindingProvider"
 
   it should "register ACTIVE, write the binding into the same executor, and close it" in {

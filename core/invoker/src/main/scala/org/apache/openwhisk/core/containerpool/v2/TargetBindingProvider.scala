@@ -80,6 +80,9 @@ final case class TargetEndpointBinding(containerIdentity: String, endpointHost: 
   require(endpointPort > 0 && endpointPort <= 65535, "target endpoint port is invalid")
 }
 
+final case class TargetEndpointBridgeRequestError(status: Int, code: String)
+    extends RuntimeException(s"target endpoint bridge request failed: status=$status code=$code")
+
 /** Worker-local bridge that maps one allocated DH endpoint to one concrete container endpoint. */
 trait TargetEndpointBridgeClient {
   def bind(containerIdentity: String, targetHost: String, targetPort: Int): Future[TargetEndpointBinding]
@@ -87,6 +90,18 @@ trait TargetEndpointBridgeClient {
 }
 
 object HttpTargetEndpointBridgeClient {
+  val TargetRuntimeNotReadyCode = "target_runtime_not_ready"
+  val RelayListenerUnavailableCode = "relay_listener_unavailable"
+  val UnknownErrorCode = "unknown"
+
+  private val KnownErrorCodes = Set(TargetRuntimeNotReadyCode, RelayListenerUnavailableCode)
+
+  private[v2] def parseErrorCode(responseBody: String): String =
+    Try(responseBody.parseJson.asJsObject.fields.get("code")) match {
+      case Success(Some(JsString(value))) if KnownErrorCodes.contains(value) => value
+      case _                                                                => UnknownErrorCode
+    }
+
   private[v2] def parseBindingResponse(expectedContainerIdentity: String,
                                        responseBody: String): TargetEndpointBinding = {
     val response = responseBody.parseJson.asJsObject
@@ -170,7 +185,7 @@ final class HttpTargetEndpointBridgeClient(controlHost: String,
           }
           .getOrElse("")
         if (status / 100 != 2) {
-          throw new IllegalStateException(s"target endpoint bridge $method failed: status=$status")
+          throw TargetEndpointBridgeRequestError(status, HttpTargetEndpointBridgeClient.parseErrorCode(responseBody))
         }
         responseBody
       } finally connection.disconnect()

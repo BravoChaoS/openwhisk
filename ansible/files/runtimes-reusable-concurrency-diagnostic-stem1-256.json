@@ -1,0 +1,45 @@
+{
+    "description": [
+        "Reusable-concurrency bridge diagnosis manifest.",
+        "One invoker starts one 256 MiB stem using the current 64 MiB full-RA runtime image."
+    ],
+    "runtimes": {
+        "nodejs": [
+            {
+                "kind": "nodejs:20",
+                "default": true,
+                "image": {
+                    "prefix": "openwhisk",
+                    "name": "action-nodejs-v20",
+                    "tag": "nightly"
+                },
+                "deprecated": false,
+                "attached": {
+                    "attachmentName": "codefile",
+                    "attachmentType": "text/plain"
+                }
+            }
+        ],
+        "reusable-concurrency": [
+            {
+                "kind": "reusable-concurrency:1",
+                "default": true,
+                "image": {
+                    "registry": "172.18.89.214:5000",
+                    "prefix": "whisk",
+                    "name": "reusable-concurrency-asyncs-ra-reuse",
+                    "tag": "261fedf-nss"
+                },
+                "deprecated": false,
+                "sentinelledLogs": false,
+                "stemCells": [
+                    {
+                        "count": 1,
+                        "memory": "256 MB"
+                    }
+                ]
+            }
+        ]
+    },
+    "blackboxes": []
+}
