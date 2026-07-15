@@ -87,6 +87,16 @@ class FPCInvokerReactive(config: WhiskConfig,
 
   private val grpcConfig = loadConfigOrThrow[GrpcServiceConfig](ConfigKeys.schedulerGrpcService)
 
+  private val reusableActivationClientDeadline =
+    sys.env.get("REUSABLE_GATEWAY_READ_TIMEOUT_MS").map(_.trim).filter(_.nonEmpty).map { value =>
+      val timeoutMs = value.toLong
+      require(timeoutMs > 0, "REUSABLE_GATEWAY_READ_TIMEOUT_MS must be positive")
+      timeoutMs.millis
+    }
+
+  private def withReusableActivationDeadline(settings: GrpcClientSettings): GrpcClientSettings =
+    reusableActivationClientDeadline.fold(settings)(settings.withDeadline)
+
   private val targetBindingProvider: TargetBindingProvider = {
     val enabled = sys.env
       .get("REUSABLE_CONCURRENCY_TARGET_BINDING_ENABLED")
@@ -273,9 +283,10 @@ class FPCInvokerReactive(config: WhiskConfig,
 
     if (!tryOtherScheduler) {
       val setting =
-        GrpcClientSettings
-          .connectToServiceAt(schedulerHost, rpcPort)
-          .withTls(grpcConfig.tls)
+        withReusableActivationDeadline(
+          GrpcClientSettings
+            .connectToServiceAt(schedulerHost, rpcPort)
+            .withTls(grpcConfig.tls))
       Future {
         ActivationServiceClient(setting)
       }.andThen {
@@ -296,9 +307,10 @@ class FPCInvokerReactive(config: WhiskConfig,
             .flatMap(Future.fromTry)
             .map { schedulerEndpoint =>
               val setting =
-                GrpcClientSettings
-                  .connectToServiceAt(schedulerEndpoint.host, schedulerEndpoint.rpcPort)
-                  .withTls(grpcConfig.tls)
+                withReusableActivationDeadline(
+                  GrpcClientSettings
+                    .connectToServiceAt(schedulerEndpoint.host, schedulerEndpoint.rpcPort)
+                    .withTls(grpcConfig.tls))
 
               ActivationServiceClient(setting)
             }
