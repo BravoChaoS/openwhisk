@@ -251,13 +251,16 @@ protected[actions] trait PrimitiveActions {
       case Some(executable) if executable.annotations.isTruthy(WhiskActivation.conductorAnnotation) =>
         Future.failed(RejectRequest(BadRequest, "C1 backend-pressure source supports primitive actions only"))
       case Some(executable) =>
+        val backendPressureWait = executable.limits.timeout.duration + 1.minute
+        val configuredWait = controllerActivationConfig.maxWaitForBlockingActivation
+        val blockingWait = if (backendPressureWait >= configuredWait) backendPressureWait else configuredWait
         def invokeWithRetry(currentMetadata: BackendPressureMetadata,
                             remainingRetries: Int): Future[BackendPressureActivationResult] = {
           invokeSimpleAction(
             user,
             executable,
             payload,
-            Some(executable.limits.timeout.duration + 1.minute),
+            Some(blockingWait),
             cause = None,
             backendPressure = Some(currentMetadata)).flatMap {
             case Right(activation) if isC1BackendPressureSchedulerFallback(activation) && remainingRetries > 0 =>
