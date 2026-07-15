@@ -36,7 +36,7 @@ class ActivationServiceImpl(targetBoundRequestTimeout: Timeout = Timeout(5.secon
   implicit actorSystem: ActorSystem,
   logging: Logging)
     extends ActivationService {
-  implicit val requestTimeout: Timeout = Timeout(5.seconds)
+  val requestTimeout: Timeout = Timeout(5.seconds)
   implicit val ec: ExecutionContextExecutor = actorSystem.dispatcher
 
   override def rescheduleActivation(request: RescheduleRequest): Future[RescheduleResponse] = {
@@ -54,7 +54,7 @@ class ActivationServiceImpl(targetBoundRequestTimeout: Timeout = Timeout(5.secon
             logging.info(
               this,
               s"Enqueue activation message to reschedule ${request.invocationNamespace} ${request.fqn} ${request.rev}")
-            queueValue.queue ? res._3
+            (queueValue.queue ? res._3)(requestTimeout)
             Future.successful(RescheduleResponse(true))
           case None =>
             logging.error(this, s"Queue not found for ${request.invocationNamespace} ${request.fqn} ${request.rev}")
@@ -90,7 +90,7 @@ class ActivationServiceImpl(targetBoundRequestTimeout: Timeout = Timeout(5.secon
                   request.warmed,
                   request.lastDuration,
                   request.alive,
-                  request.targetBindingId))
+                  request.targetBindingId))(activationRequestTimeout)
                   .mapTo[ActivationResponse]
                   .map { response =>
                     FetchResponse(response.serialize)
