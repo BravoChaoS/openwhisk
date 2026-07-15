@@ -1,0 +1,47 @@
+{
+    "description": [
+        "C1 backend-pressure AsynCS enclave-ready managed runtime manifest.",
+        "Use the fixed AsynCS HW runtime image that starts sgx_worker and reaches SERVER_READY before proxy readiness.",
+        "Keep KMS contact and encrypted function loading on the first real invocation.",
+        "Use eight 256 MB stem cells per invoker and retain nodejs:20 for the invoker health action."
+    ],
+    "runtimes": {
+        "nodejs": [
+            {
+                "kind": "nodejs:20",
+                "default": true,
+                "image": {
+                    "prefix": "openwhisk",
+                    "name": "action-nodejs-v20",
+                    "tag": "nightly"
+                },
+                "deprecated": false,
+                "attached": {
+                    "attachmentName": "codefile",
+                    "attachmentType": "text/plain"
+                }
+            }
+        ],
+        "asyncs": [
+            {
+                "kind": "asyncs:1",
+                "default": true,
+                "image": {
+                    "registry": "172.18.89.214:5000",
+                    "prefix": "acsc",
+                    "name": "openwhisk-runtime",
+                    "tag": "e3-hw-enclave-ready-20260715"
+                },
+                "deprecated": false,
+                "sentinelledLogs": false,
+                "stemCells": [
+                    {
+                        "count": 8,
+                        "memory": "256 MB"
+                    }
+                ]
+            }
+        ]
+    },
+    "blackboxes": []
+}
