@@ -290,6 +290,11 @@ class TargetBoundRuntimeContractTests
 
   behavior of "reusable-concurrency activation store policy"
 
+  it should "consume reusable-concurrency stems without immediately backfilling target slots" in {
+    ContainerPoolV2.backfillAfterTakingPrewarm(TargetBindingProvider.ReusableConcurrencyKind) shouldBe false
+    ContainerPoolV2.backfillAfterTakingPrewarm("nodejs:20") shouldBe true
+  }
+
   it should "skip the store callback only for an enabled reusable-concurrency profile" in {
     val enabled = FunctionPullingContainerProxy.reusableConcurrencyStoreSkipEnabled(
       Map(FunctionPullingContainerProxy.ReusableConcurrencySkipActivationStoreEnv -> "true"))

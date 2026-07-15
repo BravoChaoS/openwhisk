@@ -601,7 +601,9 @@ class FunctionPullingContainerPool(
         //get the appropriate ttl from prewarm configs
         val ttl =
           prewarmConfig.find(pc => pc.memoryLimit == memory && pc.exec.kind == kind).flatMap(_.reactive.map(_.ttl))
-        prewarmContainer(action.exec, data.memoryLimit, ttl)
+        if (ContainerPoolV2.backfillAfterTakingPrewarm(kind)) {
+          prewarmContainer(action.exec, data.memoryLimit, ttl)
+        }
         Some(ref, data)
     }
   }
@@ -743,6 +745,9 @@ class FunctionPullingContainerPool(
 }
 
 object ContainerPoolV2 {
+
+  private[containerpool] def backfillAfterTakingPrewarm(kind: String): Boolean =
+    kind != TargetBindingProvider.ReusableConcurrencyKind
 
   /**
    * Calculate the memory of a given pool.
