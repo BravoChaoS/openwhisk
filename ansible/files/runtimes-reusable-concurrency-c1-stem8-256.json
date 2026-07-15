@@ -1,0 +1,45 @@
+{
+    "description": [
+        "C1 reusable-concurrency 5-worker runtime manifest.",
+        "Each invoker starts eight 256 MiB reusable-concurrency stems; the runtime eagerly creates its 64 MiB SGX enclave and target session at container start."
+    ],
+    "runtimes": {
+        "nodejs": [
+            {
+                "kind": "nodejs:20",
+                "default": true,
+                "image": {
+                    "prefix": "openwhisk",
+                    "name": "action-nodejs-v20",
+                    "tag": "nightly"
+                },
+                "deprecated": false,
+                "attached": {
+                    "attachmentName": "codefile",
+                    "attachmentType": "text/plain"
+                }
+            }
+        ],
+        "reusable-concurrency": [
+            {
+                "kind": "reusable-concurrency:1",
+                "default": true,
+                "image": {
+                    "registry": "172.18.89.214:5000",
+                    "prefix": "whisk",
+                    "name": "reusable-concurrency-s1",
+                    "tag": "p3"
+                },
+                "deprecated": false,
+                "sentinelledLogs": false,
+                "stemCells": [
+                    {
+                        "count": 8,
+                        "memory": "256 MB"
+                    }
+                ]
+            }
+        ]
+    },
+    "blackboxes": []
+}
