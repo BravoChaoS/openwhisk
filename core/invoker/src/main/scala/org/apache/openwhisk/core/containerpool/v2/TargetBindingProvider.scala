@@ -80,6 +80,8 @@ final case class TargetEndpointBinding(containerIdentity: String, endpointHost: 
   require(endpointPort > 0 && endpointPort <= 65535, "target endpoint port is invalid")
 }
 
+private[v2] final case class TargetEndpointBridgeUnavailable(message: String) extends RuntimeException(message)
+
 /** Worker-local bridge that maps one allocated DH endpoint to one concrete container endpoint. */
 trait TargetEndpointBridgeClient {
   def bind(containerIdentity: String, targetHost: String, targetPort: Int): Future[TargetEndpointBinding]
@@ -169,7 +171,9 @@ final class HttpTargetEndpointBridgeClient(controlHost: String,
             finally source.close()
           }
           .getOrElse("")
-        if (status / 100 != 2) {
+        if (status == 503) {
+          throw TargetEndpointBridgeUnavailable(s"target endpoint bridge $method is not ready")
+        } else if (status / 100 != 2) {
           throw new IllegalStateException(s"target endpoint bridge $method failed: status=$status")
         }
         responseBody
@@ -205,6 +209,12 @@ final class GatewayTargetBindingProvider(
     val deadline = readyTimeout.fromNow
     val containerIdentity = target.containerId.asString
 
+    def bindEndpoint(): Future[TargetEndpointBinding] =
+      bridgeClient.bind(containerIdentity, target.address.host, containerEndpointPort).recoverWith {
+        case _: TargetEndpointBridgeUnavailable if deadline.hasTimeLeft() =>
+          after(retryInterval, actorSystem.scheduler)(bindEndpoint())
+      }
+
     def register(endpoint: TargetEndpointBinding): Future[TargetBinding] =
       gatewayClient
         .registerTarget(containerIdentity, endpoint.endpointHost, endpoint.endpointPort)
@@ -223,8 +233,7 @@ final class GatewayTargetBindingProvider(
             Future.failed(new IllegalStateException(s"Gateway target registration failed: ${error.message}"))
         }
 
-    bridgeClient
-      .bind(containerIdentity, target.address.host, containerEndpointPort)
+    bindEndpoint()
       .flatMap { endpoint =>
         register(endpoint).recoverWith {
           case failure =>

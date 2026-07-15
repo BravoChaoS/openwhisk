@@ -137,6 +137,38 @@ class TargetBoundRuntimeContractTests
     lifecycle shouldBe Seq("bridge-put", "gateway-register", "executor-target", "gateway-close", "bridge-delete")
   }
 
+  it should "wait for the concrete runtime before registering it with the Gateway" in {
+    val lifecycle = ArrayBuffer.empty[String]
+    @volatile var bridgeAttempts = 0
+    val bridge = new TargetEndpointBridgeClient {
+      override def bind(containerIdentity: String, targetHost: String, targetPort: Int) = {
+        bridgeAttempts += 1
+        lifecycle += s"bridge-put-$bridgeAttempts"
+        if (bridgeAttempts == 1) Future.failed(TargetEndpointBridgeUnavailable("runtime not ready"))
+        else Future.successful(TargetEndpointBinding(containerIdentity, "172.18.89.215", 9201))
+      }
+      override def unbind(containerIdentity: String) = Future.successful(())
+    }
+    val gateway = new GatewayControlClient {
+      override def registerTarget(containerIdentity: String, endpointHost: String, endpointPort: Int) = {
+        lifecycle += "gateway-register"
+        Future.successful(Right(GatewayRegisteredTarget(43, 9)))
+      }
+      override def closeTarget(targetBindingId: Long) = Future.successful(Right(()))
+      override def reencryptToTarget(targetBindingId: Long, sourceEnvelope: ProtectedEnvelopeV1) =
+        Future.successful(Left(GatewayControlProtocolError("unused")))
+    }
+    val provider = new GatewayTargetBindingProvider(gateway, bridge, 9200, 2.seconds, 10.millis)
+    val target = TargetContainer(
+      ContainerId("container-3"),
+      ContainerAddress("10.0.0.4"),
+      TargetBindingProvider.ReusableConcurrencyKind,
+      (_, _) => Future.successful(()))
+
+    Await.result(provider.awaitReady(target), 3.seconds).id shouldBe 43
+    lifecycle shouldBe Seq("bridge-put-1", "bridge-put-2", "gateway-register")
+  }
+
   it should "close a Gateway registration when the executor rejects /target" in {
     val lifecycle = ArrayBuffer.empty[String]
     val bridge = new TargetEndpointBridgeClient {
