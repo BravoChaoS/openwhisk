@@ -99,6 +99,70 @@ class TargetBoundRuntimeContractTests
 
   behavior of "GatewayTargetBindingProvider"
 
+  it should "retry only the fixed runtime-not-ready bridge response within the existing readiness deadline" in {
+    @volatile var bridgeAttempts = 0
+    @volatile var gatewayRegistrations = 0
+    val bridge = new TargetEndpointBridgeClient {
+      override def bind(containerIdentity: String, targetHost: String, targetPort: Int) = {
+        bridgeAttempts += 1
+        if (bridgeAttempts < 3) {
+          Future.failed(
+            TargetEndpointBridgeRequestError(503, HttpTargetEndpointBridgeClient.TargetRuntimeNotReadyCode))
+        } else {
+          Future.successful(TargetEndpointBinding(containerIdentity, "172.18.89.215", 9201))
+        }
+      }
+      override def unbind(containerIdentity: String) = Future.successful(())
+    }
+    val gateway = new GatewayControlClient {
+      override def registerTarget(containerIdentity: String, endpointHost: String, endpointPort: Int) = {
+        gatewayRegistrations += 1
+        Future.successful(Right(GatewayRegisteredTarget(40, 0)))
+      }
+      override def closeTarget(targetBindingId: Long) = Future.successful(Right(()))
+      override def reencryptToTarget(targetBindingId: Long, sourceEnvelope: ProtectedEnvelopeV1) =
+        Future.successful(Left(GatewayControlProtocolError("unused")))
+    }
+    val target = TargetContainer(
+      ContainerId("container-retry"),
+      ContainerAddress("10.0.0.4"),
+      TargetBindingProvider.ReusableConcurrencyKind,
+      (_, _) => Future.successful(()))
+
+    Await.result(new GatewayTargetBindingProvider(gateway, bridge, 9200, 2.seconds, 10.millis).awaitReady(target), 3.seconds)
+    bridgeAttempts shouldBe 3
+    gatewayRegistrations shouldBe 1
+  }
+
+  it should "fail closed without retrying another bridge 503 subtype" in {
+    @volatile var bridgeAttempts = 0
+    val bridge = new TargetEndpointBridgeClient {
+      override def bind(containerIdentity: String, targetHost: String, targetPort: Int) = {
+        bridgeAttempts += 1
+        Future.failed(
+          TargetEndpointBridgeRequestError(503, HttpTargetEndpointBridgeClient.RelayListenerUnavailableCode))
+      }
+      override def unbind(containerIdentity: String) = Future.successful(())
+    }
+    val gateway = new GatewayControlClient {
+      override def registerTarget(containerIdentity: String, endpointHost: String, endpointPort: Int) =
+        Future.failed(new AssertionError("Gateway registration must not run"))
+      override def closeTarget(targetBindingId: Long) = Future.successful(Right(()))
+      override def reencryptToTarget(targetBindingId: Long, sourceEnvelope: ProtectedEnvelopeV1) =
+        Future.successful(Left(GatewayControlProtocolError("unused")))
+    }
+    val target = TargetContainer(
+      ContainerId("container-fail-closed"),
+      ContainerAddress("10.0.0.5"),
+      TargetBindingProvider.ReusableConcurrencyKind,
+      (_, _) => Future.successful(()))
+
+    intercept[TargetEndpointBridgeRequestError] {
+      Await.result(new GatewayTargetBindingProvider(gateway, bridge, 9200, 2.seconds, 10.millis).awaitReady(target), 3.seconds)
+    }
+    bridgeAttempts shouldBe 1
+  }
+
   it should "register ACTIVE, write the binding into the same executor, and close it" in {
     @volatile var activated = Option.empty[Long]
     val lifecycle = ArrayBuffer.empty[String]

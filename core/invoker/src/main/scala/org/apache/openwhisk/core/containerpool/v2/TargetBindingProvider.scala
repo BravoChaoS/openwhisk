@@ -238,8 +238,16 @@ final class GatewayTargetBindingProvider(
             Future.failed(new IllegalStateException(s"Gateway target registration failed: ${error.message}"))
         }
 
-    bridgeClient
-      .bind(containerIdentity, target.address.host, containerEndpointPort)
+    def bindEndpoint(): Future[TargetEndpointBinding] =
+      bridgeClient
+        .bind(containerIdentity, target.address.host, containerEndpointPort)
+        .recoverWith {
+          case TargetEndpointBridgeRequestError(503, HttpTargetEndpointBridgeClient.TargetRuntimeNotReadyCode)
+              if deadline.hasTimeLeft() =>
+            after(retryInterval, actorSystem.scheduler)(bindEndpoint())
+        }
+
+    bindEndpoint()
       .flatMap { endpoint =>
         register(endpoint).recoverWith {
           case failure =>
