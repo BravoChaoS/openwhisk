@@ -32,7 +32,10 @@ import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContextExecutor, Future}
 import scala.util.Try
 
-class ActivationServiceImpl()(implicit actorSystem: ActorSystem, logging: Logging) extends ActivationService {
+class ActivationServiceImpl(targetBoundRequestTimeout: Timeout = Timeout(5.seconds))(
+  implicit actorSystem: ActorSystem,
+  logging: Logging)
+    extends ActivationService {
   implicit val requestTimeout: Timeout = Timeout(5.seconds)
   implicit val ec: ExecutionContextExecutor = actorSystem.dispatcher
 
@@ -76,6 +79,8 @@ class ActivationServiceImpl()(implicit actorSystem: ActorSystem, logging: Loggin
             QueuePool.get(MemoryQueueKey(request.invocationNamespace, key)) match {
               case Some(queueValue) =>
                 implicit val transid = TransactionId.serdes.read(request.transactionId.parseJson)
+                implicit val activationRequestTimeout: Timeout =
+                  if (request.targetBindingId.isDefined) targetBoundRequestTimeout else requestTimeout
                 if (!request.alive) logging.info(this, s"the container(${request.containerId}) is not alive")
 
                 (queueValue.queue ? GetActivation(
@@ -118,8 +123,10 @@ class ActivationServiceImpl()(implicit actorSystem: ActorSystem, logging: Loggin
 
 object ActivationServiceImpl {
 
-  def apply()(implicit actorSystem: ActorSystem, logging: Logging) =
-    new ActivationServiceImpl()
+  def apply(targetBoundRequestTimeout: Timeout = Timeout(5.seconds))(
+    implicit actorSystem: ActorSystem,
+    logging: Logging) =
+    new ActivationServiceImpl(targetBoundRequestTimeout)
 }
 
 case class GetActivation(transactionId: TransactionId,

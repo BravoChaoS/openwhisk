@@ -257,7 +257,8 @@ class Scheduler(schedulerId: SchedulerInstanceId, schedulerEndpoints: SchedulerE
       schedulerConsumer),
     QueueManager.actorName)
 
-  val serviceHandlers: HttpRequest => Future[HttpResponse] = ActivationServiceHandler.apply(ActivationServiceImpl())
+  val serviceHandlers: HttpRequest => Future[HttpResponse] =
+    ActivationServiceHandler.apply(ActivationServiceImpl(Timeout(targetBoundDispatchConfig.readTimeout)))
 }
 
 case class CmdLineArgs(uniqueName: Option[String] = None, id: Option[Int] = None, displayedName: Option[String] = None)
