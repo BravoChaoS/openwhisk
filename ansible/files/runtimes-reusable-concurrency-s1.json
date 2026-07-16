@@ -28,7 +28,7 @@
           "registry": "172.18.89.214:5000",
           "prefix": "whisk",
           "name": "reusable-concurrency-s1",
-          "tag": "p3"
+          "tag": "direct-client-result"
         },
         "deprecated": false,
         "sentinelledLogs": false
