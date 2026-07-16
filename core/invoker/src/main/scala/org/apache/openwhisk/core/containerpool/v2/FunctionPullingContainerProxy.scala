@@ -1649,6 +1649,7 @@ object FunctionPullingContainerProxy {
   private val DirectResultRidField = "rid"
   private val DirectResultKemField = "ct"
   private val DirectResultCiphertextField = "C_out"
+  private val DirectResultTimingEventsField = "producer_timing_events"
 
   private[containerpool] def reusableConcurrencyStoreSkipEnabled(environment: Map[String, String]): Boolean =
     environment
@@ -1701,7 +1702,12 @@ object FunctionPullingContainerProxy {
           case _                     => Left("protected runtime result is not an object")
         }
         _ <- Either.cond(
-          result.fields.keySet == Set(DirectResultRidField, DirectResultKemField, DirectResultCiphertextField),
+          result.fields.keySet == Set(DirectResultRidField, DirectResultKemField, DirectResultCiphertextField) ||
+            result.fields.keySet == Set(
+              DirectResultRidField,
+              DirectResultKemField,
+              DirectResultCiphertextField,
+              DirectResultTimingEventsField),
           (),
           "protected runtime result has unexpected fields")
         requestIdHash <- result.fields.get(DirectResultRidField) match {
@@ -1728,7 +1734,10 @@ object FunctionPullingContainerProxy {
             encryptedOutput.length >= 28,
           (),
           "direct-client result does not match its request/KEM contract")
-      } yield result
+      } yield JsObject(
+        DirectResultRidField -> result.fields(DirectResultRidField),
+        DirectResultKemField -> result.fields(DirectResultKemField),
+        DirectResultCiphertextField -> result.fields(DirectResultCiphertextField))
 
       parsed match {
         case Right(result) => ExecutionResponse.success(Some(result))

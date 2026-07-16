@@ -258,7 +258,7 @@ class TargetBoundRuntimeContractTests
 
   behavior of "FunctionPullingContainerProxy target-bound result adapter"
 
-  it should "preserve source binding and T2G request correlation in the full ack result" in {
+  it should "return only the direct-client ciphertext fields while accepting internal timing events" in {
     val dispatch = TargetBoundActivationContent.TargetDispatch(
       targetBindingId = 41,
       sourceBindingId = 17,
@@ -273,19 +273,18 @@ class TargetBoundRuntimeContractTests
           "status_code" -> JsNumber(0),
           "success" -> JsBoolean(true),
           "result" -> JsObject(
-            "__reusable_protected_result_envelope" -> JsString(
-              Base64.getEncoder.encodeToString(targetResult.bytes.toArray)),
-            "__reusable_protected_result_len" -> JsNumber(64),
-            "__reusable_request_id_hash" -> JsString(requestHash),
-            "__reusable_target_binding_id" -> JsNumber(41)))))
+            "rid" -> JsString(requestHash),
+            "ct" -> JsString(Base64.getEncoder.encodeToString(Array(0x04.toByte) ++ Array.fill(64)(1.toByte))),
+            "C_out" -> JsString(Base64.getEncoder.encodeToString(Array.fill(28)(2.toByte))),
+            "producer_timing_events" -> JsArray()))))
 
     val adapted = FunctionPullingContainerProxy.targetBoundRuntimeResponse(dispatch, response)
     adapted.isSuccess shouldBe true
-    val result = TargetBoundActivationContent.parseTargetResult(adapted.result).toOption.get
-    result.sourceBindingId shouldBe 17
-    result.targetBindingId shouldBe 41
-    result.requestIdHash shouldBe requestHash
-    result.targetEnvelope shouldBe targetResult
+    adapted.result shouldBe Some(
+      JsObject(
+        "rid" -> JsString(requestHash),
+        "ct" -> JsString(Base64.getEncoder.encodeToString(Array(0x04.toByte) ++ Array.fill(64)(1.toByte))),
+        "C_out" -> JsString(Base64.getEncoder.encodeToString(Array.fill(28)(2.toByte)))))
   }
 
   behavior of "reusable-concurrency activation store policy"
