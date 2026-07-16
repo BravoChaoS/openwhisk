@@ -27,8 +27,8 @@
                 "image": {
                     "registry": "172.18.89.214:5000",
                     "prefix": "whisk",
-                    "name": "reusable-concurrency-asyncs-ra-reuse",
-                    "tag": "261fedf-nss"
+                    "name": "reusable-concurrency-s1",
+                    "tag": "p3-291-1040e330"
                 },
                 "deprecated": false,
                 "sentinelledLogs": false,
