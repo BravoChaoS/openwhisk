@@ -258,7 +258,7 @@ class TargetBoundRuntimeContractTests
 
   behavior of "FunctionPullingContainerProxy target-bound result adapter"
 
-  it should "return only the direct-client ciphertext fields while accepting internal timing events" in {
+  it should "preserve internal timing events while validating direct-client ciphertext fields" in {
     val dispatch = TargetBoundActivationContent.TargetDispatch(
       targetBindingId = 41,
       sourceBindingId = 17,
@@ -284,7 +284,8 @@ class TargetBoundRuntimeContractTests
       JsObject(
         "rid" -> JsString(requestHash),
         "ct" -> JsString(Base64.getEncoder.encodeToString(Array(0x04.toByte) ++ Array.fill(64)(1.toByte))),
-        "C_out" -> JsString(Base64.getEncoder.encodeToString(Array.fill(28)(2.toByte)))))
+        "C_out" -> JsString(Base64.getEncoder.encodeToString(Array.fill(28)(2.toByte))),
+        "producer_timing_events" -> JsArray()))
   }
 
   behavior of "reusable-concurrency activation store policy"

@@ -1724,10 +1724,7 @@ object FunctionPullingContainerProxy {
             encryptedOutput.length >= 28,
           (),
           "direct-client result does not match its request/KEM contract")
-      } yield JsObject(
-        DirectResultRidField -> result.fields(DirectResultRidField),
-        DirectResultKemField -> result.fields(DirectResultKemField),
-        DirectResultCiphertextField -> result.fields(DirectResultCiphertextField))
+      } yield result
 
       parsed match {
         case Right(result) => ExecutionResponse.success(Some(result))
