@@ -28,7 +28,7 @@
           "registry": "172.18.89.214:5000",
           "prefix": "whisk",
           "name": "reusable-concurrency-s1",
-          "tag": "step2-direct-af6bfd5"
+          "tag": "step2-direct-22e19ec"
         },
         "deprecated": false,
         "sentinelledLogs": false
