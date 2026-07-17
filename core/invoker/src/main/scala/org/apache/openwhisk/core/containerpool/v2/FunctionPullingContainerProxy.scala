@@ -1646,6 +1646,10 @@ class FunctionPullingContainerProxy(
 object FunctionPullingContainerProxy {
   val ReusableConcurrencySkipActivationStoreEnv = "REUSABLE_CONCURRENCY_SKIP_ACTIVATION_STORE"
   private[containerpool] val ReusableConcurrencyStoreSkipReason = "reusable_concurrency_profile_store_skip"
+  private val DirectResultRidField = "rid"
+  private val DirectResultKemField = "ct"
+  private val DirectResultCiphertextField = "C_out"
+
   private[containerpool] def reusableConcurrencyStoreSkipEnabled(environment: Map[String, String]): Boolean =
     environment
       .get(ReusableConcurrencySkipActivationStoreEnv)
@@ -1673,7 +1677,7 @@ object FunctionPullingContainerProxy {
         "annotations" -> JsObject.empty))
   }
 
-  private[containerpool] def targetBoundRuntimeResponse(_dispatch: TargetBoundActivationContent.TargetDispatch,
+  private[containerpool] def targetBoundRuntimeResponse(dispatch: TargetBoundActivationContent.TargetDispatch,
                                                         response: ExecutionResponse): ExecutionResponse = {
     if (!response.isSuccess) {
       response
@@ -1696,6 +1700,34 @@ object FunctionPullingContainerProxy {
           case Some(value: JsObject) => Right(value)
           case _                     => Left("protected runtime result is not an object")
         }
+        _ <- Either.cond(
+          result.fields.keySet == Set(DirectResultRidField, DirectResultKemField, DirectResultCiphertextField),
+          (),
+          "protected runtime result has unexpected fields")
+        requestIdHash <- result.fields.get(DirectResultRidField) match {
+          case Some(JsString(value)) if value.matches("[0-9a-f]{64}") => Right(value)
+          case _                                                      => Left("protected runtime result has an invalid request correlation")
+        }
+        kemCiphertext <- result.fields.get(DirectResultKemField) match {
+          case Some(JsString(value)) =>
+            try Right(Base64.getDecoder.decode(value))
+            catch { case _: IllegalArgumentException => Left("direct-client KEM ciphertext is not base64") }
+          case _ => Left("protected runtime result is missing its KEM ciphertext")
+        }
+        encryptedOutput <- result.fields.get(DirectResultCiphertextField) match {
+          case Some(JsString(value)) =>
+            try Right(Base64.getDecoder.decode(value))
+            catch { case _: IllegalArgumentException => Left("direct-client output is not base64") }
+          case _ => Left("protected runtime result is missing its encrypted output")
+        }
+        expectedRequestIdHash = dispatch.targetInput.correlationHash.map(byte => f"${byte & 0xff}%02x").mkString
+        _ <- Either.cond(
+          requestIdHash == expectedRequestIdHash &&
+            kemCiphertext.length == 65 &&
+            kemCiphertext.headOption.contains(0x04.toByte) &&
+            encryptedOutput.length >= 28,
+          (),
+          "direct-client result does not match its request/KEM contract")
       } yield result
 
       parsed match {
