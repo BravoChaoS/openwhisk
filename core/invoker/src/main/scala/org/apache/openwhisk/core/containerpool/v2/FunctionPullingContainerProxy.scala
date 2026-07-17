@@ -51,12 +51,7 @@ import org.apache.openwhisk.core.etcd.EtcdKV.ContainerKeys
 import org.apache.openwhisk.core.invoker.Invoker.LogsCollector
 import org.apache.openwhisk.core.invoker.NamespaceBlacklist
 import org.apache.openwhisk.core.scheduler.SchedulerEndpoints
-import org.apache.openwhisk.core.scheduler.queue.{
-  ProtectedEnvelopeDirection,
-  ProtectedEnvelopeV1,
-  ProtectedObjectKind,
-  TargetBoundActivationContent
-}
+import org.apache.openwhisk.core.scheduler.queue.TargetBoundActivationContent
 import org.apache.openwhisk.core.service.{RegisterData, UnregisterData}
 import org.apache.openwhisk.grpc.RescheduleResponse
 import org.apache.openwhisk.http.Messages
@@ -1651,10 +1646,6 @@ class FunctionPullingContainerProxy(
 object FunctionPullingContainerProxy {
   val ReusableConcurrencySkipActivationStoreEnv = "REUSABLE_CONCURRENCY_SKIP_ACTIVATION_STORE"
   private[containerpool] val ReusableConcurrencyStoreSkipReason = "reusable_concurrency_profile_store_skip"
-  private val P2ResultEnvelopeField = "__reusable_protected_result_envelope"
-  private val P2RequestIdHashField = "__reusable_request_id_hash"
-  private val P2TargetBindingField = "__reusable_target_binding_id"
-
   private[containerpool] def reusableConcurrencyStoreSkipEnabled(environment: Map[String, String]): Boolean =
     environment
       .get(ReusableConcurrencySkipActivationStoreEnv)
@@ -1682,7 +1673,7 @@ object FunctionPullingContainerProxy {
         "annotations" -> JsObject.empty))
   }
 
-  private[containerpool] def targetBoundRuntimeResponse(dispatch: TargetBoundActivationContent.TargetDispatch,
+  private[containerpool] def targetBoundRuntimeResponse(_dispatch: TargetBoundActivationContent.TargetDispatch,
                                                         response: ExecutionResponse): ExecutionResponse = {
     if (!response.isSuccess) {
       response
@@ -1705,41 +1696,7 @@ object FunctionPullingContainerProxy {
           case Some(value: JsObject) => Right(value)
           case _                     => Left("protected runtime result is not an object")
         }
-        encodedEnvelope <- result.fields.get(P2ResultEnvelopeField) match {
-          case Some(JsString(value)) => Right(value)
-          case _                     => Left("protected runtime result is missing its T2G envelope")
-        }
-        envelopeBytes <- try Right(
-          org.apache.pekko.util.ByteString.fromArray(Base64.getDecoder.decode(encodedEnvelope)))
-        catch {
-          case _: IllegalArgumentException => Left("protected runtime result envelope is not base64")
-        }
-        envelope <- ProtectedEnvelopeV1.decode(envelopeBytes)
-        requestIdHash <- result.fields.get(P2RequestIdHashField) match {
-          case Some(JsString(value)) if value.matches("[0-9a-f]{64}") => Right(value)
-          case _                                                      => Left("protected runtime result has an invalid request correlation")
-        }
-        targetBindingId <- result.fields.get(P2TargetBindingField) match {
-          case Some(JsNumber(value)) if value.isValidLong => Right(value.toLong)
-          case Some(JsString(value)) =>
-            try Right(value.toLong)
-            catch { case _: NumberFormatException => Left("protected runtime result has an invalid target binding") }
-          case _ => Left("protected runtime result is missing its target binding")
-        }
-        expectedRequestIdHash = dispatch.targetInput.correlationHash.map(byte => f"${byte & 0xff}%02x").mkString
-        _ <- Either.cond(
-          targetBindingId == dispatch.targetBindingId &&
-            envelope.bindingId == dispatch.targetBindingId &&
-            envelope.kind == ProtectedObjectKind.Result &&
-            envelope.direction == ProtectedEnvelopeDirection.TargetToGateway &&
-            requestIdHash == expectedRequestIdHash &&
-            envelope.correlationHash == dispatch.targetInput.correlationHash,
-          (),
-          "protected runtime result does not match its target/request correlation")
-      } yield
-        TargetBoundActivationContent.targetResult(
-          TargetBoundActivationContent
-            .TargetResult(dispatch.sourceBindingId, dispatch.targetBindingId, requestIdHash, envelope))
+      } yield result
 
       parsed match {
         case Right(result) => ExecutionResponse.success(Some(result))
