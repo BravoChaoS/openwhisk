@@ -1700,10 +1700,6 @@ object FunctionPullingContainerProxy {
           case Some(value: JsObject) => Right(value)
           case _                     => Left("protected runtime result is not an object")
         }
-        _ <- Either.cond(
-          result.fields.keySet == Set(DirectResultRidField, DirectResultKemField, DirectResultCiphertextField),
-          (),
-          "protected runtime result has unexpected fields")
         requestIdHash <- result.fields.get(DirectResultRidField) match {
           case Some(JsString(value)) if value.matches("[0-9a-f]{64}") => Right(value)
           case _                                                      => Left("protected runtime result has an invalid request correlation")
@@ -1728,7 +1724,10 @@ object FunctionPullingContainerProxy {
             encryptedOutput.length >= 28,
           (),
           "direct-client result does not match its request/KEM contract")
-      } yield result
+      } yield JsObject(
+        DirectResultRidField -> result.fields(DirectResultRidField),
+        DirectResultKemField -> result.fields(DirectResultKemField),
+        DirectResultCiphertextField -> result.fields(DirectResultCiphertextField))
 
       parsed match {
         case Right(result) => ExecutionResponse.success(Some(result))
