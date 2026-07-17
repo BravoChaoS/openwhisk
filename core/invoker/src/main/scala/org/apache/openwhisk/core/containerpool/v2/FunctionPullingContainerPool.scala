@@ -126,6 +126,8 @@ class FunctionPullingContainerPool(
   private var preWarmScheduler: Option[Cancellable] = None
   private var prewarmConfigQueue = Queue.empty[(CodeExec[_], ByteSize, Option[FiniteDuration])]
   private val prewarmCreateFailedCount = new AtomicInteger(0)
+  private val reusableConcurrencyDisablePrewarmBackfill =
+    sys.env.get("REUSABLE_CONCURRENCY_DISABLE_PREWARM_BACKFILL").exists(_.equalsIgnoreCase("true"))
 
   val logScheduler = context.system.scheduler.scheduleAtFixedRate(0.seconds, 1.seconds)(() => {
     MetricEmitter.emitHistogramMetric(
@@ -401,7 +403,7 @@ class FunctionPullingContainerPool(
       }
 
       //backfill prewarms on every ContainerRemoved, just in case
-      if (replacePrewarm) {
+      if (replacePrewarm && !reusableConcurrencyDisablePrewarmBackfill) {
         adjustPrewarmedContainer(false, false) //in case a prewarm is removed due to health failure or crash
       }
 
@@ -434,7 +436,9 @@ class FunctionPullingContainerPool(
     case AdjustPrewarmedContainer =>
       // Reset the prewarmCreateCount value when do expiration check and backfill prewarm if possible
       prewarmCreateFailedCount.set(0)
-      adjustPrewarmedContainer(false, true)
+      if (!reusableConcurrencyDisablePrewarmBackfill) {
+        adjustPrewarmedContainer(false, true)
+      }
     case GetState =>
       val totalContainers = busyPool.size + inProgressPool.size + warmedPool.size + prewarmedPool.size
       val prewarmedState =
@@ -601,7 +605,9 @@ class FunctionPullingContainerPool(
         //get the appropriate ttl from prewarm configs
         val ttl =
           prewarmConfig.find(pc => pc.memoryLimit == memory && pc.exec.kind == kind).flatMap(_.reactive.map(_.ttl))
-        prewarmContainer(action.exec, data.memoryLimit, ttl)
+        if (!reusableConcurrencyDisablePrewarmBackfill) {
+          prewarmContainer(action.exec, data.memoryLimit, ttl)
+        }
         Some(ref, data)
     }
   }
