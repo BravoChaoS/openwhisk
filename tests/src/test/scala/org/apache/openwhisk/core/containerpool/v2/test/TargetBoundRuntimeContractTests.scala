@@ -17,6 +17,8 @@
 
 package org.apache.openwhisk.core.containerpool.v2.test
 
+import java.util.Base64
+
 import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.testkit.TestKit
 import org.apache.pekko.util.ByteString
@@ -256,7 +258,7 @@ class TargetBoundRuntimeContractTests
 
   behavior of "FunctionPullingContainerProxy target-bound result adapter"
 
-  it should "return a successful target runtime result through the ordinary activation response" in {
+  it should "preserve internal timing events while validating direct-client ciphertext fields" in {
     val dispatch = TargetBoundActivationContent.TargetDispatch(
       targetBindingId = 41,
       sourceBindingId = 17,
@@ -270,11 +272,20 @@ class TargetBoundRuntimeContractTests
           "status" -> JsString("success"),
           "status_code" -> JsNumber(0),
           "success" -> JsBoolean(true),
-          "result" -> JsObject("sleep_ms" -> JsNumber(50), "ok" -> JsBoolean(true)))))
+          "result" -> JsObject(
+            "rid" -> JsString(requestHash),
+            "ct" -> JsString(Base64.getEncoder.encodeToString(Array(0x04.toByte) ++ Array.fill(64)(1.toByte))),
+            "C_out" -> JsString(Base64.getEncoder.encodeToString(Array.fill(28)(2.toByte))),
+            "producer_timing_events" -> JsArray()))))
 
     val adapted = FunctionPullingContainerProxy.targetBoundRuntimeResponse(dispatch, response)
     adapted.isSuccess shouldBe true
-    adapted.result shouldBe Some(JsObject("sleep_ms" -> JsNumber(50), "ok" -> JsBoolean(true)))
+    adapted.result shouldBe Some(
+      JsObject(
+        "rid" -> JsString(requestHash),
+        "ct" -> JsString(Base64.getEncoder.encodeToString(Array(0x04.toByte) ++ Array.fill(64)(1.toByte))),
+        "C_out" -> JsString(Base64.getEncoder.encodeToString(Array.fill(28)(2.toByte))),
+        "producer_timing_events" -> JsArray()))
   }
 
   behavior of "reusable-concurrency activation store policy"
@@ -320,6 +331,7 @@ class TargetBoundRuntimeContractTests
   }
 
   private val correlation = ByteString.fromArray((0 until 32).map(_.toByte).toArray)
+  private val requestHash = correlation.map(byte => f"${byte & 0xff}%02x").mkString
   private val targetInput = ProtectedEnvelopeV1(
     ProtectedObjectKind.Input,
     ProtectedEnvelopeDirection.GatewayToTarget,
@@ -329,4 +341,13 @@ class TargetBoundRuntimeContractTests
     ByteString.fromArray((0 until 12).map(_.toByte).toArray),
     ByteString("input"),
     ByteString.fromArray(Array.fill(16)(1.toByte)))
+  private val targetResult = ProtectedEnvelopeV1(
+    ProtectedObjectKind.Result,
+    ProtectedEnvelopeDirection.TargetToGateway,
+    41,
+    ProtectedCorrelationKind.RequestId,
+    correlation,
+    ByteString.fromArray((128 until 140).map(_.toByte).toArray),
+    ByteString("result"),
+    ByteString.fromArray(Array.fill(16)(2.toByte)))
 }
