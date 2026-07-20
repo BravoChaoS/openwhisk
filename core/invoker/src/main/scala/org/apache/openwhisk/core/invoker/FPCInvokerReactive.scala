@@ -94,14 +94,25 @@ class FPCInvokerReactive(config: WhiskConfig,
       timeoutMs.millis
     }
 
-  private def withReusableActivationDeadline(settings: GrpcClientSettings): GrpcClientSettings =
-    reusableActivationClientDeadline.fold(settings)(settings.withDeadline)
-
-  private val targetBindingProvider: TargetBindingProvider = {
-    val enabled = sys.env
+  private val reusableTargetBindingEnabled =
+    sys.env
       .get("REUSABLE_CONCURRENCY_TARGET_BINDING_ENABLED")
       .exists(value => Set("1", "true", "yes").contains(value.trim.toLowerCase))
-    if (!enabled) {
+
+  private val reusableActivationMaxInboundMessageBytes = 8 * 1024 * 1024
+
+  private def withReusableActivationSettings(settings: GrpcClientSettings): GrpcClientSettings = {
+    val withDeadline = reusableActivationClientDeadline.fold(settings)(settings.withDeadline)
+    if (reusableTargetBindingEnabled) {
+      withDeadline.withChannelBuilderOverrides(
+        _.maxInboundMessageSize(reusableActivationMaxInboundMessageBytes))
+    } else {
+      withDeadline
+    }
+  }
+
+  private val targetBindingProvider: TargetBindingProvider = {
+    if (!reusableTargetBindingEnabled) {
       TargetBindingProvider.Disabled
     } else {
       def required(name: String): String =
@@ -283,7 +294,7 @@ class FPCInvokerReactive(config: WhiskConfig,
 
     if (!tryOtherScheduler) {
       val setting =
-        withReusableActivationDeadline(
+        withReusableActivationSettings(
           GrpcClientSettings
             .connectToServiceAt(schedulerHost, rpcPort)
             .withTls(grpcConfig.tls))
@@ -307,7 +318,7 @@ class FPCInvokerReactive(config: WhiskConfig,
             .flatMap(Future.fromTry)
             .map { schedulerEndpoint =>
               val setting =
-                withReusableActivationDeadline(
+                withReusableActivationSettings(
                   GrpcClientSettings
                     .connectToServiceAt(schedulerEndpoint.host, schedulerEndpoint.rpcPort)
                     .withTls(grpcConfig.tls))
