@@ -1,0 +1,46 @@
+{
+    "description": [
+        "C2 fresh-placement AsynCS managed runtime manifest.",
+        "Use the versioned C2 HW runtime image with four 256 MB stem cells per invoker.",
+        "Retain nodejs:20 without stem cells for the OpenWhisk invoker health action."
+    ],
+    "runtimes": {
+        "nodejs": [
+            {
+                "kind": "nodejs:20",
+                "default": true,
+                "image": {
+                    "prefix": "openwhisk",
+                    "name": "action-nodejs-v20",
+                    "tag": "nightly"
+                },
+                "deprecated": false,
+                "attached": {
+                    "attachmentName": "codefile",
+                    "attachmentType": "text/plain"
+                }
+            }
+        ],
+        "asyncs": [
+            {
+                "kind": "asyncs:1",
+                "default": true,
+                "image": {
+                    "registry": "172.18.89.214:5000",
+                    "prefix": "acsc",
+                    "name": "openwhisk-runtime",
+                    "tag": "c2-sleep50-package-grid-hw-20260720"
+                },
+                "deprecated": false,
+                "sentinelledLogs": false,
+                "stemCells": [
+                    {
+                        "count": 4,
+                        "memory": "256 MB"
+                    }
+                ]
+            }
+        ]
+    },
+    "blackboxes": []
+}
