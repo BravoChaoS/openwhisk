@@ -240,7 +240,12 @@ class FunctionPullingContainerProxy(
   private var timedOut = false
   private var activeTargetBinding = Option.empty[(TargetContainer, TargetBinding)]
   private var targetBoundRemovalStarted = false
-  private var pendingTargetBoundRemoval = Option.empty[(Container, Boolean)]
+  private case class PendingTargetBoundRemoval(container: Container,
+                                               wasPaused: Boolean,
+                                               revision: Option[DocRevision],
+                                               replacePrewarm: Boolean)
+  private var pendingTargetBoundRemoval = Option.empty[PendingTargetBoundRemoval]
+  private var targetBoundContainerRemovedSent = false
   private val c1TimingProcessId = ManagementFactory.getRuntimeMXBean.getName.takeWhile(_ != '@')
   private val c1TimingNode = sys.env.get("C1_TIMING_NODE_ID").orElse(sys.env.get("HOSTNAME")).getOrElse("")
   private val c1InternalRescheduleInjectionReason = "c1_internal_reschedule_injection"
@@ -260,6 +265,46 @@ class FunctionPullingContainerProxy(
     value.replace('|', '_').replace('\n', ' ').replace('\r', ' ')
 
   private def c1TimingField(key: String, value: String): String = s"$key=${c1TimingSanitize(value)}"
+
+  private def emitReusableTargetLifecycle(eventCode: String,
+                                          stage: String,
+                                          container: Container,
+                                          binding: Option[TargetBinding],
+                                          revision: Option[DocRevision],
+                                          replacePrewarm: Option[Boolean] = None,
+                                          status: String = "ok"): Unit = {
+    val fields = Seq(
+      c1TimingField("event_code", eventCode),
+      c1TimingField("stage", stage),
+      c1TimingField("status", status),
+      c1TimingField("container_id", container.containerId.asString),
+      c1TimingField("target_binding_id", binding.map(_.id.toString).getOrElse("")),
+      c1TimingField("action_revision", revision.flatMap(value => Option(value.rev)).getOrElse("")),
+      c1TimingField("replace_prewarm", replacePrewarm.map(_.toString).getOrElse("")),
+      c1TimingField("actor", self.path.toStringWithoutAddress),
+      c1TimingField("node", c1TimingNode),
+      c1TimingField("process", "openwhisk_invoker"),
+      c1TimingField("pid", c1TimingProcessId),
+      c1TimingField("unix_ns", (System.currentTimeMillis() * 1000000L).toString),
+      c1TimingField("mono_ns", System.nanoTime().toString),
+      c1TimingField("clock_domain", "openwhisk_invoker_jvm_mono"))
+    logging.info(this, s"REUSABLE_TARGET_LIFECYCLE|${fields.mkString("|")}")(TransactionId.invokerNanny)
+  }
+
+  private def sendTargetBoundContainerRemoved(pending: PendingTargetBoundRemoval, status: String): Unit = {
+    if (!targetBoundContainerRemovedSent) {
+      targetBoundContainerRemovedSent = true
+      emitReusableTargetLifecycle(
+        "RTL_CONTAINER_REMOVED_SEND",
+        "container_removed_send",
+        pending.container,
+        activeTargetBinding.map(_._2),
+        pending.revision,
+        Some(pending.replacePrewarm),
+        status)
+      context.parent ! ContainerRemoved(pending.replacePrewarm)
+    }
+  }
 
   private def isBackendPressureActivation(msg: ActivationMessage): Boolean =
     msg.metrics.get("c1_backend_pressure").contains(1L)
@@ -499,6 +544,15 @@ class FunctionPullingContainerProxy(
     // container was successfully obtained
     case Event(completed: PreWarmContainerReady, _: NonexistentData) =>
       activeTargetBinding = completed.binding
+      completed.binding.foreach {
+        case (_, binding) =>
+          emitReusableTargetLifecycle(
+            "RTL_REGISTRATION_READY",
+            "target_registration_ready",
+            completed.data.container,
+            Some(binding),
+            None)
+      }
       context.parent ! ReadyToWork(completed.data)
       goto(ContainerCreated) using completed.data
 
@@ -531,6 +585,15 @@ class FunctionPullingContainerProxy(
   when(CreatingClient) {
     case Event(ready: ColdContainerReady, _) =>
       activeTargetBinding = ready.binding
+      ready.binding.foreach {
+        case (_, binding) =>
+          emitReusableTargetLifecycle(
+            "RTL_REGISTRATION_READY",
+            "target_registration_ready",
+            ready.container,
+            Some(binding),
+            Some(ready.job.action.rev))
+      }
       createActivationClient(ready.job, ready.container).fold(self ! _, self ! _)
       stay()
 
@@ -978,7 +1041,9 @@ class FunctionPullingContainerProxy(
 
     case Event(ClientClosed, _) => stop()
 
-    case Event(TargetBoundContainerRemovalCompleted, _) => stop()
+    case Event(TargetBoundContainerRemovalCompleted, _) =>
+      pendingTargetBoundRemoval.foreach(sendTargetBoundContainerRemoved(_, "ok"))
+      stop()
 
     case Event(TargetBoundContainerRemovalFailed(cause), _) =>
       logging.error(this, s"target binding close failed during container removal: ${cause.getMessage}")
@@ -1079,14 +1144,18 @@ class FunctionPullingContainerProxy(
     dataManagementService ! UnregisterData(
       s"${ContainerKeys.existingContainers(invocationNamespace, fqn, revision, Some(instance), Some(container.containerId))}")
 
-    cleanUp(container, clientProxy)
+    cleanUp(container, clientProxy, revision = Some(revision))
   }
 
-  private def cleanUp(container: Container, clientProxy: Option[ActorRef], replacePrewarm: Boolean = true): State = {
-    context.parent ! ContainerRemoved(replacePrewarm)
+  private def cleanUp(container: Container,
+                      clientProxy: Option[ActorRef],
+                      replacePrewarm: Boolean = true,
+                      revision: Option[DocRevision] = None): State = {
     if (activeTargetBinding.isDefined) {
-      pendingTargetBoundRemoval = Some(container -> (stateName == Paused))
+      pendingTargetBoundRemoval = Some(
+        PendingTargetBoundRemoval(container, stateName == Paused, revision, replacePrewarm))
     } else {
+      context.parent ! ContainerRemoved(replacePrewarm)
       val unpause = stateName match {
         case Paused => container.resume()(TransactionId.invokerNanny)
         case _      => Future.successful(())
@@ -1108,17 +1177,63 @@ class FunctionPullingContainerProxy(
   private def beginTargetBoundRemoval(): Unit = {
     if (!targetBoundRemovalStarted) {
       (pendingTargetBoundRemoval, activeTargetBinding) match {
-        case (Some((container, wasPaused)), Some((target, binding))) =>
+        case (Some(pending), Some((target, binding))) =>
           targetBoundRemovalStarted = true
+          val container = pending.container
           val unpause =
-            if (wasPaused) container.resume()(TransactionId.invokerNanny)
+            if (pending.wasPaused) container.resume()(TransactionId.invokerNanny)
             else Future.successful(())
           unpause
-            .flatMap(_ => targetBindingProvider.closeBinding(target, binding))
+            .flatMap { _ =>
+              emitReusableTargetLifecycle(
+                "RTL_CLOSE_BEGIN",
+                "close_binding_begin",
+                container,
+                Some(binding),
+                pending.revision,
+                Some(pending.replacePrewarm))
+              targetBindingProvider.closeBinding(target, binding)
+            }
             .transformWith {
-              case Success(_) => destroyContainer(container)
+              case Success(_) =>
+                emitReusableTargetLifecycle(
+                  "RTL_CLOSE_END",
+                  "close_binding_end",
+                  container,
+                  Some(binding),
+                  pending.revision,
+                  Some(pending.replacePrewarm))
+                destroyContainer(container).andThen {
+                  case Success(_) =>
+                    emitReusableTargetLifecycle(
+                      "RTL_DESTROY_COMPLETE",
+                      "destroy_complete",
+                      container,
+                      Some(binding),
+                      pending.revision,
+                      Some(pending.replacePrewarm))
+                }
               case Failure(closeFailure) =>
-                destroyContainer(container).transform(_ => Failure(closeFailure))
+                emitReusableTargetLifecycle(
+                  "RTL_CLOSE_END",
+                  "close_binding_end",
+                  container,
+                  Some(binding),
+                  pending.revision,
+                  Some(pending.replacePrewarm),
+                  "failed")
+                destroyContainer(container)
+                  .andThen {
+                    case Success(_) =>
+                      emitReusableTargetLifecycle(
+                        "RTL_DESTROY_COMPLETE",
+                        "destroy_complete",
+                        container,
+                        Some(binding),
+                        pending.revision,
+                        Some(pending.replacePrewarm))
+                  }
+                  .transform(_ => Failure(closeFailure))
             }
             .map(_ => TargetBoundContainerRemovalCompleted)
             .recover { case t => TargetBoundContainerRemovalFailed(t) }

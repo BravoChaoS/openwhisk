@@ -17,6 +17,7 @@
 
 package org.apache.openwhisk.core.containerpool.v2
 
+import java.lang.management.ManagementFactory
 import java.util.concurrent.atomic.AtomicInteger
 
 import org.apache.pekko.actor.{Actor, ActorRef, ActorRefFactory, Cancellable, Props}
@@ -128,6 +129,30 @@ class FunctionPullingContainerPool(
   private val prewarmCreateFailedCount = new AtomicInteger(0)
   private val reusableConcurrencyDisablePrewarmBackfill =
     sys.env.get("REUSABLE_CONCURRENCY_DISABLE_PREWARM_BACKFILL").exists(_.equalsIgnoreCase("true"))
+  private val reusableLifecycleProcessId = ManagementFactory.getRuntimeMXBean.getName.takeWhile(_ != '@')
+  private val reusableLifecycleNode = sys.env.get("C1_TIMING_NODE_ID").orElse(sys.env.get("HOSTNAME")).getOrElse("")
+
+  private def reusableLifecycleField(key: String, value: String): String =
+    s"$key=${value.replace('|', '_').replace('\n', ' ').replace('\r', ' ')}"
+
+  private def emitReusableTargetLifecycle(eventCode: String,
+                                          stage: String,
+                                          containerActor: ActorRef,
+                                          replacePrewarm: Boolean): Unit = {
+    val fields = Seq(
+      reusableLifecycleField("event_code", eventCode),
+      reusableLifecycleField("stage", stage),
+      reusableLifecycleField("status", "ok"),
+      reusableLifecycleField("container_actor", containerActor.path.toStringWithoutAddress),
+      reusableLifecycleField("replace_prewarm", replacePrewarm.toString),
+      reusableLifecycleField("node", reusableLifecycleNode),
+      reusableLifecycleField("process", "openwhisk_invoker_pool"),
+      reusableLifecycleField("pid", reusableLifecycleProcessId),
+      reusableLifecycleField("unix_ns", (System.currentTimeMillis() * 1000000L).toString),
+      reusableLifecycleField("mono_ns", System.nanoTime().toString),
+      reusableLifecycleField("clock_domain", "openwhisk_invoker_jvm_mono"))
+    logging.info(this, s"REUSABLE_TARGET_LIFECYCLE|${fields.mkString("|")}")(TransactionId.invokerNanny)
+  }
 
   val logScheduler = context.system.scheduler.scheduleAtFixedRate(0.seconds, 1.seconds)(() => {
     MetricEmitter.emitHistogramMetric(
@@ -380,6 +405,11 @@ class FunctionPullingContainerPool(
 
     // Container got removed
     case ContainerRemoved(replacePrewarm) =>
+      emitReusableTargetLifecycle(
+        "RTL_CONTAINER_REMOVED_RECEIVE",
+        "container_removed_receive",
+        sender(),
+        replacePrewarm)
       inProgressPool = inProgressPool - sender()
       warmedPool = warmedPool - sender()
       disablingPool -= sender()
@@ -404,6 +434,7 @@ class FunctionPullingContainerPool(
 
       //backfill prewarms on every ContainerRemoved, just in case
       if (replacePrewarm && !reusableConcurrencyDisablePrewarmBackfill) {
+        emitReusableTargetLifecycle("RTL_BACKFILL_BEGIN", "normal_backfill_begin", sender(), replacePrewarm)
         adjustPrewarmedContainer(false, false) //in case a prewarm is removed due to health failure or crash
       }
 

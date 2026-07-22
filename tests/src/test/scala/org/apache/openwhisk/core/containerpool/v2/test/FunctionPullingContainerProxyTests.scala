@@ -667,15 +667,22 @@ class FunctionPullingContainerProxyTests
   it should "wait for an ACTIVE target binding before the first pull and close it before destroy" in within(timeout) {
     val authStore = mock[ArtifactWhiskAuthStore]
     val namespaceBlacklist: NamespaceBlacklist = new NamespaceBlacklist(authStore)
-    val container = new TestContainer
+    val destroyPromise = Promise[Unit]()
+    val container = new TestContainer {
+      override def destroy()(implicit transid: TransactionId): Future[Unit] = {
+        destroyCount += 1
+        destroyPromise.future
+      }
+    }
     val bindingPromise = Promise[TargetBinding]()
+    val closePromise = Promise[Unit]()
     @volatile var closedBinding = Option.empty[(TargetContainer, TargetBinding)]
     val provider = new TargetBindingProvider {
       override def requiresBinding(kind: String): Boolean = kind == action.exec.kind
       override def awaitReady(target: TargetContainer): Future[TargetBinding] = bindingPromise.future
       override def closeBinding(target: TargetContainer, binding: TargetBinding): Future[Unit] = {
         closedBinding = Some(target -> binding)
-        Future.successful(())
+        closePromise.future
       }
     }
     val client = TestProbe()
@@ -722,10 +729,20 @@ class FunctionPullingContainerProxyTests
 
     probe.watch(machine)
     machine ! ClientClosed
-    probe.expectMsgAllOf(ContainerRemoved(true), Transition(machine, CreatingClient, Removing))
+    probe.expectMsg(Transition(machine, CreatingClient, Removing))
+    awaitAssert(closedBinding.map(_._2.id) shouldBe Some(41L))
+    probe.expectNoMessage(100.milliseconds)
+    container.destroyCount shouldBe 0
+
+    closePromise.success(())
+    awaitAssert(container.destroyCount shouldBe 1)
+    probe.expectNoMessage(100.milliseconds)
+
+    destroyPromise.success(())
+    probe.expectMsg(ContainerRemoved(true))
     probe.expectTerminated(machine)
-    closedBinding.map(_._2.id) shouldBe Some(41L)
     container.destroyCount shouldBe 1
+    probe.expectNoMessage(100.milliseconds)
   }
 
   it should "run actions to a cold start container with get no activationMessage" in within(timeout) {
