@@ -333,6 +333,11 @@
   set_fact:
     env: "{{ env | combine(invoker.extraEnv) }}"
 
+- name: set optional FPC activation client inbound message limit
+  set_fact:
+    env: "{{ env | combine({'FPC_ACTIVATION_MAX_INBOUND_MESSAGE_BYTES': fpc_activation_max_inbound_message_bytes | string}) }}"
+  when: fpc_activation_max_inbound_message_bytes is defined
+
 - name: setup elasticsearch activation store env
   set_fact:
     elastic_env:
