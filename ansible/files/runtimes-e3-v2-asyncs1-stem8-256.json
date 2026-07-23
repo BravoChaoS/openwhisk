@@ -1,0 +1,46 @@
+{
+    "description": [
+        "E3 v2 AsynCS managed runtime manifest.",
+        "Use the runtime built from ACSC 7d8c2bb with eight 256 MB stem cells per invoker.",
+        "Retain nodejs:20 without stem cells for the OpenWhisk invoker health action."
+    ],
+    "runtimes": {
+        "nodejs": [
+            {
+                "kind": "nodejs:20",
+                "default": true,
+                "image": {
+                    "prefix": "openwhisk",
+                    "name": "action-nodejs-v20",
+                    "tag": "nightly"
+                },
+                "deprecated": false,
+                "attached": {
+                    "attachmentName": "codefile",
+                    "attachmentType": "text/plain"
+                }
+            }
+        ],
+        "asyncs": [
+            {
+                "kind": "asyncs:1",
+                "default": true,
+                "image": {
+                    "registry": "172.18.89.214:5000",
+                    "prefix": "acsc",
+                    "name": "openwhisk-runtime",
+                    "tag": "e3-v2-7d8c2bb-hw"
+                },
+                "deprecated": false,
+                "sentinelledLogs": false,
+                "stemCells": [
+                    {
+                        "count": 8,
+                        "memory": "256 MB"
+                    }
+                ]
+            }
+        ]
+    },
+    "blackboxes": []
+}
