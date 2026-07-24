@@ -58,6 +58,33 @@ case class GrpcServiceConfig(tls: Boolean)
 
 object FPCInvokerReactive extends InvokerProvider {
 
+  private[invoker] val ActivationMaxInboundMessageBytesEnv = "FPC_ACTIVATION_MAX_INBOUND_MESSAGE_BYTES"
+
+  private[invoker] def activationMaxInboundMessageBytes(value: Option[String]): Option[Int] =
+    value.map { raw =>
+      val bytes = Try(raw.trim.toInt).getOrElse {
+        throw new IllegalArgumentException(s"$ActivationMaxInboundMessageBytesEnv must be a positive integer")
+      }
+      if (bytes <= 0) {
+        throw new IllegalArgumentException(s"$ActivationMaxInboundMessageBytesEnv must be a positive integer")
+      }
+      bytes
+    }
+
+  private[invoker] def activationClientSettings(schedulerHost: String,
+                                                rpcPort: Int,
+                                                tls: Boolean,
+                                                maxInboundMessageBytes: Option[Int])(
+    implicit actorSystem: ActorSystem): GrpcClientSettings = {
+    val settings =
+      GrpcClientSettings
+        .connectToServiceAt(schedulerHost, rpcPort)
+        .withTls(tls)
+    maxInboundMessageBytes.fold(settings) { bytes =>
+      settings.withChannelBuilderOverrides(_.maxInboundMessageSize(bytes))
+    }
+  }
+
   override def instance(
     config: WhiskConfig,
     instance: InvokerInstanceId,
@@ -86,6 +113,10 @@ class FPCInvokerReactive(config: WhiskConfig,
   private val etcdClient = EtcdClient(loadConfigOrThrow[EtcdConfig](ConfigKeys.etcd))
 
   private val grpcConfig = loadConfigOrThrow[GrpcServiceConfig](ConfigKeys.schedulerGrpcService)
+
+  private val activationClientMaxInboundMessageBytes =
+    FPCInvokerReactive.activationMaxInboundMessageBytes(
+      sys.env.get(FPCInvokerReactive.ActivationMaxInboundMessageBytesEnv))
 
   private val targetBindingProvider: TargetBindingProvider = {
     val enabled = sys.env
@@ -273,9 +304,11 @@ class FPCInvokerReactive(config: WhiskConfig,
 
     if (!tryOtherScheduler) {
       val setting =
-        GrpcClientSettings
-          .connectToServiceAt(schedulerHost, rpcPort)
-          .withTls(grpcConfig.tls)
+        FPCInvokerReactive.activationClientSettings(
+          schedulerHost,
+          rpcPort,
+          grpcConfig.tls,
+          activationClientMaxInboundMessageBytes)
       Future {
         ActivationServiceClient(setting)
       }.andThen {
@@ -296,9 +329,11 @@ class FPCInvokerReactive(config: WhiskConfig,
             .flatMap(Future.fromTry)
             .map { schedulerEndpoint =>
               val setting =
-                GrpcClientSettings
-                  .connectToServiceAt(schedulerEndpoint.host, schedulerEndpoint.rpcPort)
-                  .withTls(grpcConfig.tls)
+                FPCInvokerReactive.activationClientSettings(
+                  schedulerEndpoint.host,
+                  schedulerEndpoint.rpcPort,
+                  grpcConfig.tls,
+                  activationClientMaxInboundMessageBytes)
 
               ActivationServiceClient(setting)
             }
