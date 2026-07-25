@@ -58,6 +58,23 @@ case class GrpcServiceConfig(tls: Boolean)
 
 object FPCInvokerReactive extends InvokerProvider {
 
+  private[invoker] val ReusableActivationMaxInboundMessageBytesEnv =
+    "FPC_ACTIVATION_MAX_INBOUND_MESSAGE_BYTES"
+  private[invoker] val ReusableActivationDefaultMaxInboundMessageBytes = 8 * 1024 * 1024
+
+  private[invoker] def reusableActivationMaxInboundMessageBytes(value: Option[String]): Int =
+    value.fold(ReusableActivationDefaultMaxInboundMessageBytes) { raw =>
+      val bytes = Try(raw.trim.toInt).getOrElse {
+        throw new IllegalArgumentException(
+          s"$ReusableActivationMaxInboundMessageBytesEnv must be a positive integer")
+      }
+      if (bytes <= 0) {
+        throw new IllegalArgumentException(
+          s"$ReusableActivationMaxInboundMessageBytesEnv must be a positive integer")
+      }
+      bytes
+    }
+
   override def instance(
     config: WhiskConfig,
     instance: InvokerInstanceId,
@@ -99,7 +116,9 @@ class FPCInvokerReactive(config: WhiskConfig,
       .get("REUSABLE_CONCURRENCY_TARGET_BINDING_ENABLED")
       .exists(value => Set("1", "true", "yes").contains(value.trim.toLowerCase))
 
-  private val reusableActivationMaxInboundMessageBytes = 8 * 1024 * 1024
+  private val reusableActivationMaxInboundMessageBytes =
+    FPCInvokerReactive.reusableActivationMaxInboundMessageBytes(
+      sys.env.get(FPCInvokerReactive.ReusableActivationMaxInboundMessageBytesEnv))
 
   private def withReusableActivationSettings(settings: GrpcClientSettings): GrpcClientSettings = {
     val withDeadline = reusableActivationClientDeadline.fold(settings)(settings.withDeadline)
